@@ -1,3 +1,6 @@
+[![Build status](https://github.com/PacificBiosciences/waffle_con/actions/workflows/test-ci.yml/badge.svg)](https://github.com/PacificBiosciences/waffle_con/actions)
+
+
 # waffle_con
 This crate contains our implementation of the Dynamic WFA (DWFA) consensus algorithms, or `waffle_con`.
 The algorithms contained within were built to support the consensus steps of [pb-StarPhase](https://github.com/PacificBiosciences/pb-StarPhase).

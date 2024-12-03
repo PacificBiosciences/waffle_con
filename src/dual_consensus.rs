@@ -477,14 +477,11 @@ impl<'a> DualConsensusDWFA<'a> {
                         );
                         trace!("\tadding to ret");//: {dual_con_result:?}");
                         trace!("\tcon1: {}", std::str::from_utf8(dual_con_result.consensus1().sequence())?);
-                        trace!("\tcon2: {}", std::str::from_utf8(dual_con_result.consensus2().unwrap().sequence())?);
-                        /*
                         if let Some(c2) = dual_con_result.consensus2() {
                             trace!("\tcon2: {}", std::str::from_utf8(c2.sequence())?);
                         } else {
                             trace!("\tcon2: None");
                         }
-                        */
                         ret.push(dual_con_result);
                     }
                 } else {

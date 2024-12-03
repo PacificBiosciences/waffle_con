@@ -10,5 +10,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: cargo test --all-features --release
+      - run: RUST_LOG=trace cargo test --all-features --release
       - run: cargo clippy -- -D warnings

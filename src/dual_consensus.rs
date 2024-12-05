@@ -871,6 +871,9 @@ impl DualConsensusNode {
             vec![(&mut self.dwfas1, &self.consensus1)]
         };
 
+        // we need to truncate the compare length if it is longer than the sequence
+        let offset_compare_length = offset_compare_length.min(sequence.len());
+
         for (dwfas, consensus) in activators.into_iter() {
             // make sure everything is currently inactive
             assert!(dwfas[seq_index].is_none());

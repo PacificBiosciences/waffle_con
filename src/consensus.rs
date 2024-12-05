@@ -416,6 +416,9 @@ impl ConsensusNode {
 
         // build up the search space
         let con_len = self.consensus.len();
+
+        // we need to truncate the compare length if it is longer than the sequence
+        let offset_compare_length = offset_compare_length.min(sequence.len());
         
         // figure out how far back we search
         let start_delta = offset_window + offset_compare_length; // we search from current back to the offset_window

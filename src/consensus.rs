@@ -27,16 +27,17 @@ assert_eq!(consensuses[0].scores(), &[1, 0, 1]);
 */
 
 use log::{debug, trace};
-use priority_queue::PriorityQueue;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use simple_error::bail;
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
 
 use crate::cdwfa_config::{CdwfaConfig, ConsensusCost};
 use crate::dynamic_wfa::DWFALite;
 use crate::pqueue_tracker::PQueueTracker;
 
-type NodePriority = (Reverse<usize>, usize);
+/// Lower cost, then longer consensus, then an earlier tie-breaker.
+type NodePriority = (Reverse<usize>, usize, Reverse<u64>);
 
 /// Contains a final consensus result
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -211,12 +212,13 @@ impl<'a> ConsensusDWFA<'a> {
         let mut pqueue_tracker = PQueueTracker::with_capacity(initial_size, max_capacity_per_size);
 
         let initial_node = ConsensusNode::new_root_node(&offsets, self.config.wildcard, self.config.allow_early_termination)?;
-        let initial_priority = initial_node.priority(self.consensus_cost());
-        
-        // start the priority queue, which defaults to bigger is better so we need a Reverse since want smaller costs
-        let mut pqueue: PriorityQueue<ConsensusNode, NodePriority> = PriorityQueue::new();
+
+        // Max-heap ordered by queued priority: lower cost, then longer consensus, then earlier tie-breaker.
+        let mut pqueue: BinaryHeap<ConsensusNode> = BinaryHeap::new();
+        let mut next_id: u64 = 0;
         pqueue_tracker.insert(initial_node.consensus().len());
-        pqueue.push(initial_node, initial_priority);
+        initial_node.enqueue(&mut pqueue, next_id, self.consensus_cost());
+        next_id += 1;
 
         let mut ret = vec![];
 
@@ -232,7 +234,8 @@ impl<'a> ConsensusDWFA<'a> {
             }
 
             // get the top node and check if it's bad
-            let (top_node, top_priority) = pqueue.pop().unwrap();
+            let top_node = pqueue.pop().unwrap();
+            let top_priority = top_node.queued_priority;
             let top_len = top_node.consensus().len();
             pqueue_tracker.remove(top_len);
 
@@ -332,10 +335,10 @@ impl<'a> ConsensusDWFA<'a> {
                 }
 
                 // get the new cost and put it in the queue
-                let new_priority = new_node.priority(self.consensus_cost());
-                trace!("\tPush {:?} => {:?}", new_priority, new_node.consensus);
+                trace!("\tPush {next_id} => {:?}", new_node.consensus);
                 pqueue_tracker.insert(new_node.consensus().len());
-                pqueue.push(new_node, new_priority);
+                new_node.enqueue(&mut pqueue, next_id, self.consensus_cost());
+                next_id += 1;
             }
         }
 
@@ -364,13 +367,38 @@ impl<'a> ConsensusDWFA<'a> {
     }
 }
 
-/// Wrapper for a node containing a partial consensus as well as the DWFA tracking for that node
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+/// Wrapper for a node containing a partial consensus as well as the DWFA tracking for that node.
+#[derive(Clone, Debug, Eq)]
 struct ConsensusNode {
     /// The consensus sequence so far
     consensus: Vec<u8>,
     /// The DWFAs that are tracked for each sequence; these are only None if they have not been activated yet due to an offset
-    dwfas: Vec<Option<DWFALite>>
+    dwfas: Vec<Option<DWFALite>>,
+    /// Rank in the search heap: lower cost, then longer consensus, then earlier tie-breaker. Set when the node is enqueued.
+    queued_priority: NodePriority,
+}
+
+// The following Eq and Ord implementations are specifically for the Binary Heap.
+// They should not be used for actual node comparison.
+
+impl PartialEq for ConsensusNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.queued_priority == other.queued_priority
+    }
+}
+
+impl PartialOrd for ConsensusNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ConsensusNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap pops the greatest node. queued_priority already ranks a lower edit distance,
+        // then a longer consensus, then an earlier tie-breaker.
+        self.queued_priority.cmp(&other.queued_priority)
+    }
 }
 
 impl ConsensusNode {
@@ -398,8 +426,21 @@ impl ConsensusNode {
 
         Ok(ConsensusNode {
             consensus: vec![],
-            dwfas
+            dwfas,
+            queued_priority: (Reverse(0), 0, Reverse(0)),
         })
+    }
+
+    /// Caches this node's search priority and moves it into the heap (consuming the node).
+    /// The rank is the current edit-distance cost, then consensus length, then `tie_breaker`.
+    /// A lower tie-breaker was enqueued earlier and wins when cost and length match.
+    /// # Arguments
+    /// * `heap` - the search heap that receives this node
+    /// * `tie_breaker` - tie-breaker value when other values are equal; in practice, used as an incremented ID to get deterministic ordering
+    /// * `consensus_cost` - cost model used to score the node
+    fn enqueue(mut self, heap: &mut BinaryHeap<ConsensusNode>, tie_breaker: u64, consensus_cost: ConsensusCost) {
+        self.queued_priority = self.priority(consensus_cost, tie_breaker);
+        heap.push(self);
     }
 
     /// This will activate the DWFAs for a particular sequence.
@@ -499,13 +540,15 @@ impl ConsensusNode {
     }
 
     /// Returns the node priority.
-    /// Currently, this is based on 1) lowest cost and 2) consensus length.
+    /// Rank is 1) lowest cost, 2) consensus length, and 3) earlier tie-breaker.
     /// # Arguments
     /// * `consensus_cost` - cost model to evaluate the cost
-    fn priority(&self, consensus_cost: ConsensusCost) -> NodePriority {
+    /// * `tie_breaker` - insertion order; a lower value is earlier and wins ties
+    fn priority(&self, consensus_cost: ConsensusCost, tie_breaker: u64) -> NodePriority {
         (
             Reverse(self.total_cost(consensus_cost)),
-            self.consensus.len()
+            self.consensus.len(),
+            Reverse(tie_breaker),
         )
     }
 
@@ -574,6 +617,26 @@ mod tests {
     use super::*;
 
     use crate::cdwfa_config::CdwfaConfigBuilder;
+
+    #[test]
+    fn test_heap_orders_by_priority_then_id() {
+        let offsets = vec![None];
+        let mut earlier = ConsensusNode::new_root_node(&offsets, None, false).unwrap();
+        let mut later = ConsensusNode::new_root_node(&offsets, None, false).unwrap();
+        let mut cheaper = ConsensusNode::new_root_node(&offsets, None, false).unwrap();
+        earlier.queued_priority = (Reverse(1), 0, Reverse(0));
+        later.queued_priority = (Reverse(1), 0, Reverse(1));
+        cheaper.queued_priority = (Reverse(0), 0, Reverse(2));
+
+        let mut heap = BinaryHeap::new();
+        heap.push(later);
+        heap.push(earlier);
+        heap.push(cheaper);
+
+        assert_eq!(heap.pop().unwrap().queued_priority.2.0, 2);
+        assert_eq!(heap.pop().unwrap().queued_priority.2.0, 0);
+        assert_eq!(heap.pop().unwrap().queued_priority.2.0, 1);
+    }
 
     #[test]
     fn test_single_sequence() {

@@ -36,17 +36,20 @@ assert_eq!(consensuses[0].is_consensus1(), &[true, true, true, true, false, fals
 */
 
 use log::{debug, trace, warn};
-use priority_queue::PriorityQueue;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use simple_error::{bail, SimpleError};
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
 
 use crate::cdwfa_config::{CdwfaConfig, ConsensusCost};
 use crate::consensus::Consensus;
 use crate::dynamic_wfa::DWFALite;
 use crate::pqueue_tracker::PQueueTracker;
 
-type NodePriority = (Reverse<usize>, usize);
+/// We have a max-hap, so (Reverse(edit distance), length).
+/// This mean lowest edit distance first, tie-break with the longest consensus length.
+/// Lower cost, then longer consensus, then an earlier tie-breaker.
+type NodePriority = (Reverse<usize>, usize, Reverse<u64>);
 
 /// Contains a final multi-consensus result
 #[derive(Debug)]
@@ -311,12 +314,13 @@ impl<'a> DualConsensusDWFA<'a> {
         let mut dual_tracker = PQueueTracker::with_capacity(initial_size, max_capacity_per_size);
 
         let initial_node = DualConsensusNode::new_root_node(&offsets, self.config.wildcard, self.config.allow_early_termination)?;
-        let initial_priority = initial_node.priority(self.consensus_cost());
 
-        // start the priority queue, which defaults to bigger is better so we need a Reverse since want smaller costs
-        let mut pqueue: PriorityQueue<DualConsensusNode, NodePriority> = PriorityQueue::new();
+        // Max-heap ordered by cached priority: lower cost, then longer consensus, then earlier tie-breaker.
+        let mut pqueue: BinaryHeap<DualConsensusNode> = BinaryHeap::new();
+        let mut next_id: u64 = 0;
         single_tracker.insert(initial_node.max_consensus_length());
-        pqueue.push(initial_node, initial_priority);
+        initial_node.enqueue(&mut pqueue, next_id, self.consensus_cost());
+        next_id += 1;
 
         let mut ret: Vec<DualConsensus> = vec![];
         let mut last_indiv = 0;
@@ -352,7 +356,8 @@ impl<'a> DualConsensusDWFA<'a> {
             }
 
             // get the top node and check if it's bad
-            let (top_node, top_cost) = pqueue.pop().unwrap();
+            let top_node = pqueue.pop().unwrap();
+            let top_cost = top_node.queued_priority;
             let top_len = top_node.max_consensus_length();
 
             let (threshold_cutoff, at_capacity) = if top_node.is_dual {
@@ -642,10 +647,10 @@ impl<'a> DualConsensusDWFA<'a> {
                         new_node.prune_dwfa(self.config.dual_max_ed_delta)?;
 
                         // get the new cost and put it in the queue
-                        let new_priority = new_node.priority(self.consensus_cost());
                         assert!(new_node.is_dual);
                         dual_tracker.insert(new_node.max_consensus_length()); // top_node is already dual
-                        assert!(pqueue.push(new_node.clone(), new_priority).is_none());
+                        new_node.enqueue(&mut pqueue, next_id, self.consensus_cost());
+                        next_id += 1;
                     }
                 }
             } else {
@@ -672,10 +677,10 @@ impl<'a> DualConsensusDWFA<'a> {
                     }
 
                     // get the new cost and put it in the queue
-                    let new_priority = new_node.priority(self.consensus_cost());
                     assert!(!new_node.is_dual);
                     single_tracker.insert(new_node.max_consensus_length());
-                    assert!(pqueue.push(new_node.clone(), new_priority).is_none());
+                    new_node.enqueue(&mut pqueue, next_id, self.consensus_cost());
+                    next_id += 1;
                 }
 
                 // now handle dual-node generation
@@ -725,10 +730,10 @@ impl<'a> DualConsensusDWFA<'a> {
                             new_node.prune_dwfa(self.config.dual_max_ed_delta)?;
 
                             // get the new cost and put it in the queue
-                            let new_priority = new_node.priority(self.consensus_cost());
                             assert!(new_node.is_dual);
                             dual_tracker.insert(new_node.max_consensus_length());
-                            assert!(pqueue.push(new_node.clone(), new_priority).is_none());
+                            new_node.enqueue(&mut pqueue, next_id, self.consensus_cost());
+                            next_id += 1;
                         }
                     }
                 }
@@ -800,8 +805,8 @@ impl<'a> DualConsensusDWFA<'a> {
     }
 }
 
-/// Wrapper for a node containing a partial consensus as well as the DWFA tracking for that node
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+/// Wrapper for a node containing a partial consensus as well as the DWFA tracking for that node.
+#[derive(Clone, Debug, Eq)]
 struct DualConsensusNode {
     /// if True, then this node is tracking two consensuses
     is_dual: bool,
@@ -817,6 +822,31 @@ struct DualConsensusNode {
     dwfas1: Vec<Option<DWFALite>>,
     /// The set of DWFAs for consensus2; these are options because we stop tracking once the scores diverge
     dwfas2: Vec<Option<DWFALite>>,
+    /// Rank in the search heap: lower cost, then longer consensus, then earlier tie-breaker. Set when the node is enqueued.
+    queued_priority: NodePriority,
+}
+
+// The following Eq and Ord implementations are specifically for the Binary Heap.
+// They should not be used for actual node comparison.
+
+impl PartialEq for DualConsensusNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.queued_priority == other.queued_priority
+    }
+}
+
+impl PartialOrd for DualConsensusNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DualConsensusNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap pops the greatest node. queued_priority already ranks a lower edit distance,
+        // then a longer consensus, then an earlier tie-breaker.
+        self.queued_priority.cmp(&other.queued_priority)
+    }
 }
 
 impl DualConsensusNode {
@@ -851,8 +881,21 @@ impl DualConsensusNode {
             consensus1: vec![],
             consensus2: vec![],
             dwfas1: dwfas,
-            dwfas2: vec![None; offsets.len()]
+            dwfas2: vec![None; offsets.len()],
+            queued_priority: (Reverse(0), 0, Reverse(0)),
         })
+    }
+
+    /// Caches this node's search priority and moves it into the heap (consuming the node).
+    /// The rank is the current edit-distance cost, then consensus length, then `tie_breaker`.
+    /// A lower tie-breaker was enqueued earlier and wins when cost and length match.
+    /// # Arguments
+    /// * `heap` - the search heap that receives this node
+    /// * `tie_breaker` - tie-breaker value when other values are equal; in practice, used as a incremented ID to get deterministic ordering
+    /// * `consensus_cost` - cost model used to score the node
+    fn enqueue(mut self, heap: &mut BinaryHeap<DualConsensusNode>, tie_breaker: u64, consensus_cost: ConsensusCost) {
+        self.queued_priority = self.priority(consensus_cost, tie_breaker);
+        heap.push(self);
     }
 
     /// This will activate the DWFAs for a particular sequence.
@@ -1157,13 +1200,15 @@ impl DualConsensusNode {
     }
 
     /// Returns the node priority.
-    /// Currently, this is based on 1) lowest cost and 2) consensus length.
+    /// Rank is 1) lowest cost, 2) consensus length, and 3) earlier tie-breaker.
     /// # Arguments
     /// * `consensus_cost` - cost model to evaluate the cost
-    fn priority(&self, consensus_cost: ConsensusCost) -> NodePriority {
+    /// * `tie_breaker` - insertion order; a lower value is earlier and wins ties
+    fn priority(&self, consensus_cost: ConsensusCost, tie_breaker: u64) -> NodePriority {
         (
             Reverse(self.total_cost(consensus_cost)),
-            self.max_consensus_length()
+            self.max_consensus_length(),
+            Reverse(tie_breaker),
         )
     }
 
@@ -1358,6 +1403,26 @@ mod tests {
     use crate::cdwfa_config::CdwfaConfigBuilder;
 
     // first some more targeted tests
+    #[test]
+    fn test_heap_orders_by_priority_then_id() {
+        let offsets = vec![None];
+        let mut earlier = DualConsensusNode::new_root_node(&offsets, None, false).unwrap();
+        let mut later = DualConsensusNode::new_root_node(&offsets, None, false).unwrap();
+        let mut cheaper = DualConsensusNode::new_root_node(&offsets, None, false).unwrap();
+        earlier.queued_priority = (Reverse(1), 0, Reverse(0));
+        later.queued_priority = (Reverse(1), 0, Reverse(1));
+        cheaper.queued_priority = (Reverse(0), 0, Reverse(2));
+
+        let mut heap = BinaryHeap::new();
+        heap.push(later);
+        heap.push(earlier);
+        heap.push(cheaper);
+
+        assert_eq!(heap.pop().unwrap().queued_priority.2.0, 2);
+        assert_eq!(heap.pop().unwrap().queued_priority.2.0, 0);
+        assert_eq!(heap.pop().unwrap().queued_priority.2.0, 1);
+    }
+
     #[test]
     fn test_get_ed_weights() {
         let vec_sequences = vec![

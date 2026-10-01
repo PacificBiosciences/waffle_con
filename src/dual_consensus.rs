@@ -113,7 +113,7 @@ impl DualConsensus {
         let mut is_consensus1: Vec<bool> = Default::default();
         let mut consensus_scores: Vec<Vec<usize>> = vec![vec![]; 2];
         for (best_con_index, best_con_score) in best_consensus_index.into_iter()
-            .zip(best_consensus_score.into_iter()) {
+            .zip(best_consensus_score) {
             // these MUST be equal length
             // store that this sequence index matches the particular consensus index
             assert!(best_con_index <= 1);

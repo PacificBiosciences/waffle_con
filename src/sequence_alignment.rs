@@ -52,7 +52,7 @@ pub fn wfa_ed_config(v1: &[u8], v2: &[u8], require_both_end: bool, wildcard: Opt
             let mut j = wf.1;
 
             // as long as the symbols match, keep moving along the diagonal
-            while i < l1 && j < l2 && (v1[i] == v2[j] || wildcard.map_or(false, |w| v1[i] == w) || wildcard.map_or(false, |w| w == v2[j])) {
+            while i < l1 && j < l2 && (v1[i] == v2[j] || wildcard.is_some_and(|w| v1[i] == w) || wildcard.is_some_and(|w| w == v2[j])) {
                 i += 1;
                 j += 1;
             }

@@ -33,7 +33,7 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 
 use crate::cdwfa_config::{CdwfaConfig, ConsensusCost};
-use crate::dynamic_wfa::DWFALite;
+use crate::dynamic_wfa::{DWFALite, DWFALiteState};
 use crate::pqueue_tracker::PQueueTracker;
 
 /// Lower cost, then longer consensus, then an earlier tie-breaker.
@@ -211,7 +211,7 @@ impl<'a> ConsensusDWFA<'a> {
         let initial_size = self.sequences.iter().map(|s| s.len()).max().unwrap();
         let mut pqueue_tracker = PQueueTracker::with_capacity(initial_size, max_capacity_per_size);
 
-        let initial_node = ConsensusNode::new_root_node(&offsets, self.config.wildcard, self.config.allow_early_termination)?;
+        let initial_node = ConsensusNode::new_root_node(&self.sequences, &offsets, &self.config)?;
 
         // Max-heap ordered by queued priority: lower cost, then longer consensus, then earlier tie-breaker.
         let mut pqueue: BinaryHeap<ConsensusNode> = BinaryHeap::new();
@@ -330,7 +330,7 @@ impl<'a> ConsensusDWFA<'a> {
                 if let Some(activate_list) = opt_activate_list {
                     assert!(!activate_list.is_empty());
                     for &seq_index in activate_list.iter() {
-                        new_node.activate_sequence(self.sequences[seq_index], seq_index, offset_window, offset_compare_length, self.config.wildcard, self.config.allow_early_termination)?;
+                        new_node.activate_sequence(self.sequences[seq_index], seq_index, offset_window, offset_compare_length, &self.config)?;
                     }
                 }
 
@@ -404,20 +404,27 @@ impl Ord for ConsensusNode {
 impl ConsensusNode {
     /// Constructor for a new consensus search root node
     /// # Arguments
+    /// * `sequences` - the baseline reads, parallel to `offsets`
     /// * `offsets` - a set of offsets into the sequences where the approximate starts are
-    /// * `wildcard` - an optional wildcard symbol that will match anything
-    /// * `allow_early_termination` - if true, then it will allow the consensus to go beyond the provided baseline sequences without penalty
+    /// * `config` - consensus configuration
     /// # Errors
     /// * if DWFA construction fails
-    fn new_root_node(offsets: &[Option<usize>], wildcard: Option<u8>, allow_early_termination: bool) -> Result<ConsensusNode, Box<dyn std::error::Error>> {
-        let dwfas: Vec<Option<DWFALite>> = offsets.iter()
-            .map(|offset| match offset {
+    /// * if `sequences` and `offsets` have different lengths
+    fn new_root_node(sequences: &[&[u8]], offsets: &[Option<usize>], config: &CdwfaConfig) -> Result<ConsensusNode, Box<dyn std::error::Error>> {
+        if sequences.len() != offsets.len() {
+            bail!("Sequence and offset counts must match.");
+        }
+        let mut dwfas = Vec::with_capacity(offsets.len());
+        for (sequence, offset) in sequences.iter().zip(offsets.iter()) {
+            let dwfa = if offset.is_some() {
                 // we have an offset, so do not create a map
-                Some(_o) => None,
-                // we don't have an offset, so this is active from the start
-                None => Some(DWFALite::new(wildcard, allow_early_termination))
-            })
-            .collect();
+                None
+            } else {
+                // active from the start; cap is fixed from this read's length
+                Some(DWFALite::new(config.dwfa_lite_config_for(sequence.len())?))
+            };
+            dwfas.push(dwfa);
+        }
 
         let active_count = dwfas.iter().filter(|d| d.is_some()).count();
         if active_count == 0 {
@@ -449,9 +456,8 @@ impl ConsensusNode {
     /// * `seq_index` - the sequence index, which will map to the DWFAs
     /// * `offset_window` - the window we are searching for a best match
     /// * `offset_compare_length` - the amount of bases we are comparing
-    /// * `wildcard` - optional wildcard for scoring, passed into DWFA
-    /// * `allow_early_termination` - enables sequences to end partway through the consensus, passed into DWFA
-    fn activate_sequence(&mut self, sequence: &[u8], seq_index: usize, offset_window: usize, offset_compare_length: usize, wildcard: Option<u8>, allow_early_termination: bool) -> Result<(), Box<dyn std::error::Error>> {
+    /// * `config` - consensus configuration, including wildcard, early termination, and the edit-distance cap
+    fn activate_sequence(&mut self, sequence: &[u8], seq_index: usize, offset_window: usize, offset_compare_length: usize, config: &CdwfaConfig) -> Result<(), Box<dyn std::error::Error>> {
         // make sure everything is currently inactive
         assert!(self.dwfas[seq_index].is_none());
 
@@ -468,19 +474,19 @@ impl ConsensusNode {
 
         // figure out which offset has the best score; assume the middle of the offset window is the best
         let mut best_offset = con_len.saturating_sub(offset_compare_length + offset_window / 2);
-        let mut min_ed = crate::sequence_alignment::wfa_ed_config(&self.consensus[best_offset..], &sequence[0..offset_compare_length], false, wildcard);
+        let mut min_ed = crate::sequence_alignment::wfa_ed_config(&self.consensus[best_offset..], &sequence[0..offset_compare_length], false, config.wildcard);
         
         // now check all the rest around this position
         for p in start_position..end_position {
-            let ed = crate::sequence_alignment::wfa_ed_config(&self.consensus[p..], &sequence[0..offset_compare_length], false, wildcard);
+            let ed = crate::sequence_alignment::wfa_ed_config(&self.consensus[p..], &sequence[0..offset_compare_length], false, config.wildcard);
             if ed < min_ed {
                 min_ed = ed;
                 best_offset = p;
             }
         }
 
-        // now set up the DWFA with the best offset
-        let mut new_dwfa = DWFALite::new(wildcard, allow_early_termination);
+        // now set up the DWFA with the best offset and a cap from this read's length
+        let mut new_dwfa = DWFALite::new(config.dwfa_lite_config_for(sequence.len())?);
         new_dwfa.set_offset(best_offset);
         new_dwfa.update(sequence, &self.consensus)?;
         self.dwfas[seq_index] = Some(new_dwfa);
@@ -560,7 +566,13 @@ impl ConsensusNode {
         let mut end_iter = baseline_sequences.iter().zip(self.dwfas.iter())
             .map(|(&baseline, opt_dwfa)| {
                 if let Some(dwfa) = opt_dwfa.as_ref() {
-                    dwfa.reached_baseline_end(baseline)
+                    if dwfa.state() == DWFALiteState::ExceededEditDistanceLimit {
+                        // A capped read must not finish the consensus early, and must not block when every read has to finish.
+                        // So by returning the require_all value, we silently skip this read in either case.
+                        require_all
+                    } else {
+                        dwfa.reached_baseline_end(baseline)
+                    }
                 } else {
                     false
                 }
@@ -620,10 +632,12 @@ mod tests {
 
     #[test]
     fn test_heap_orders_by_priority_then_id() {
+        let sequences: [&[u8]; 1] = [b""];
         let offsets = vec![None];
-        let mut earlier = ConsensusNode::new_root_node(&offsets, None, false).unwrap();
-        let mut later = ConsensusNode::new_root_node(&offsets, None, false).unwrap();
-        let mut cheaper = ConsensusNode::new_root_node(&offsets, None, false).unwrap();
+        let config = CdwfaConfig::default();
+        let mut earlier = ConsensusNode::new_root_node(&sequences, &offsets, &config).unwrap();
+        let mut later = ConsensusNode::new_root_node(&sequences, &offsets, &config).unwrap();
+        let mut cheaper = ConsensusNode::new_root_node(&sequences, &offsets, &config).unwrap();
         earlier.queued_priority = (Reverse(1), 0, Reverse(0));
         later.queued_priority = (Reverse(1), 0, Reverse(1));
         cheaper.queued_priority = (Reverse(0), 0, Reverse(2));
@@ -911,5 +925,25 @@ mod tests {
         assert!(consensus_err.is_err());
         let error = consensus_err.err().unwrap();
         assert_eq!(error.to_string(), "Finalize called on DWFA that was never initialized.");
+    }
+
+    #[test]
+    fn test_edit_distance_cap_ignores_outlier() {
+        let good = b"ACGTACGTACGT";
+        let bad = b"TTTTTTTTTTTT";
+        let mut consensus_dwfa = ConsensusDWFA::with_config(
+            CdwfaConfigBuilder::default()
+                .max_edit_distance(Some(3))
+                .build().unwrap()
+        ).unwrap();
+        consensus_dwfa.add_sequence(good).unwrap();
+        consensus_dwfa.add_sequence(good).unwrap();
+        consensus_dwfa.add_sequence(good).unwrap();
+        consensus_dwfa.add_sequence(bad).unwrap();
+
+        let consensus = consensus_dwfa.consensus().unwrap();
+        assert_eq!(consensus.len(), 1);
+        assert_eq!(consensus[0].sequence(), good);
+        assert_eq!(consensus[0].scores(), &[0, 0, 0, 3]);
     }
 }

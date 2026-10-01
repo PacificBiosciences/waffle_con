@@ -43,7 +43,7 @@ use std::collections::BinaryHeap;
 
 use crate::cdwfa_config::{CdwfaConfig, ConsensusCost};
 use crate::consensus::Consensus;
-use crate::dynamic_wfa::DWFALite;
+use crate::dynamic_wfa::{DWFALite, DWFALiteState};
 use crate::pqueue_tracker::PQueueTracker;
 
 /// We have a max-hap, so (Reverse(edit distance), length).
@@ -313,7 +313,7 @@ impl<'a> DualConsensusDWFA<'a> {
         let mut single_tracker = PQueueTracker::with_capacity(initial_size, max_capacity_per_size);
         let mut dual_tracker = PQueueTracker::with_capacity(initial_size, max_capacity_per_size);
 
-        let initial_node = DualConsensusNode::new_root_node(&offsets, self.config.wildcard, self.config.allow_early_termination)?;
+        let initial_node = DualConsensusNode::new_root_node(&self.sequences, &offsets, &self.config)?;
 
         // Max-heap ordered by cached priority: lower cost, then longer consensus, then earlier tie-breaker.
         let mut pqueue: BinaryHeap<DualConsensusNode> = BinaryHeap::new();
@@ -639,7 +639,7 @@ impl<'a> DualConsensusDWFA<'a> {
                         if let Some(activate_list) = opt_activate_list {
                             assert!(!activate_list.is_empty());
                             for &seq_index in activate_list.iter() {
-                                new_node.activate_sequence(self.sequences[seq_index], seq_index, offset_window, offset_compare_length, self.config.wildcard, self.config.allow_early_termination)?;
+                                new_node.activate_sequence(self.sequences[seq_index], seq_index, offset_window, offset_compare_length, &self.config)?;
                             }
                         }
 
@@ -672,7 +672,7 @@ impl<'a> DualConsensusDWFA<'a> {
                     if let Some(activate_list) = opt_activate_list {
                         assert!(!activate_list.is_empty());
                         for &seq_index in activate_list.iter() {
-                            new_node.activate_sequence(self.sequences[seq_index], seq_index, offset_window, offset_compare_length, self.config.wildcard, self.config.allow_early_termination)?;
+                            new_node.activate_sequence(self.sequences[seq_index], seq_index, offset_window, offset_compare_length, &self.config)?;
                         }
                     }
 
@@ -722,7 +722,7 @@ impl<'a> DualConsensusDWFA<'a> {
                             if let Some(activate_list) = opt_activate_list {
                                 assert!(!activate_list.is_empty());
                                 for &seq_index in activate_list.iter() {
-                                    new_node.activate_sequence(self.sequences[seq_index], seq_index, offset_window, offset_compare_length, self.config.wildcard, self.config.allow_early_termination)?;
+                                    new_node.activate_sequence(self.sequences[seq_index], seq_index, offset_window, offset_compare_length, &self.config)?;
                                 }
                             }
 
@@ -779,7 +779,7 @@ impl<'a> DualConsensusDWFA<'a> {
 
             // TODO: how do we want to handle this long-term? this returns an empty string consensus
             let no_offsets = vec![None; self.sequences.len()]; // we need these to get costs of 0
-            let root_node = DualConsensusNode::new_root_node(&no_offsets, self.config.wildcard, self.config.allow_early_termination)?;
+            let root_node = DualConsensusNode::new_root_node(&self.sequences, &no_offsets, &self.config)?;
             ret.push(DualConsensus::from_node(&root_node, self.consensus_cost()));
         }
 
@@ -853,20 +853,27 @@ impl DualConsensusNode {
     /// Constructor for a new consensus search root node.
     /// Note that initial it is not a dual node, it will become that when divergence is detected.
     /// # Arguments
+    /// * `sequences` - the baseline reads, parallel to `offsets`
     /// * `offsets` - a set of offsets into the sequences where the approximate starts are
-    /// * `wildcard` - an optional wildcard symbol that will match anything
-    /// * `allow_early_termination` - if true, then it will allow the consensus to go beyond the provided baseline sequences without penalty
+    /// * `config` - consensus configuration, including the optional edit-distance cap
     /// # Errors
     /// * if DWFA construction fails
-    fn new_root_node(offsets: &[Option<usize>], wildcard: Option<u8>, allow_early_termination: bool) -> Result<DualConsensusNode, Box<dyn std::error::Error>> {
-        let dwfas: Vec<Option<DWFALite>> = offsets.iter()
-            .map(|offset| match offset {
+    /// * if `sequences` and `offsets` have different lengths
+    fn new_root_node(sequences: &[&[u8]], offsets: &[Option<usize>], config: &CdwfaConfig) -> Result<DualConsensusNode, Box<dyn std::error::Error>> {
+        if sequences.len() != offsets.len() {
+            bail!("Sequence and offset counts must match.");
+        }
+        let mut dwfas = Vec::with_capacity(offsets.len());
+        for (sequence, offset) in sequences.iter().zip(offsets.iter()) {
+            let dwfa = if offset.is_some() {
                 // we have an offset, so do not create a map
-                Some(_o) => None,
-                // we don't have an offset, so this is active from the start
-                None => Some(DWFALite::new(wildcard, allow_early_termination))
-            })
-            .collect();
+                None
+            } else {
+                // active from the start; cap is fixed from this read's length
+                Some(DWFALite::new(config.dwfa_lite_config_for(sequence.len())?))
+            };
+            dwfas.push(dwfa);
+        }
 
         let active_count = dwfas.iter().filter(|d| d.is_some()).count();
         if active_count == 0 {
@@ -904,9 +911,8 @@ impl DualConsensusNode {
     /// * `seq_index` - the sequence index, which will map to the DWFAs
     /// * `offset_window` - the window we are searching for a best match
     /// * `offset_compare_length` - the amount of bases we are comparing
-    /// * `wildcard` - optional wildcard for scoring, passed into DWFA
-    /// * `allow_early_termination` - enables sequences to end partway through the consensus, passed into DWFA
-    fn activate_sequence(&mut self, sequence: &[u8], seq_index: usize, offset_window: usize, offset_compare_length: usize, wildcard: Option<u8>, allow_early_termination: bool) -> Result<(), Box<dyn std::error::Error>> {
+    /// * `config` - consensus configuration, including wildcard, early termination, and the edit-distance cap
+    fn activate_sequence(&mut self, sequence: &[u8], seq_index: usize, offset_window: usize, offset_compare_length: usize, config: &CdwfaConfig) -> Result<(), Box<dyn std::error::Error>> {
         // figure out whether we need to just do con1 or both
         let activators = if self.is_dual {
             vec![(&mut self.dwfas1, &self.consensus1), (&mut self.dwfas2, &self.consensus2)]
@@ -928,18 +934,18 @@ impl DualConsensusNode {
 
             // figure out which offset has the best score; assume the middle of the offset window is the best
             let mut best_offset = con_len.saturating_sub(offset_compare_length + offset_window / 2);
-            let mut min_ed = crate::sequence_alignment::wfa_ed_config(&consensus[best_offset..], &sequence[0..offset_compare_length], false, wildcard);
+            let mut min_ed = crate::sequence_alignment::wfa_ed_config(&consensus[best_offset..], &sequence[0..offset_compare_length], false, config.wildcard);
             
             for p in start_position..end_position {
-                let ed = crate::sequence_alignment::wfa_ed_config(&consensus[p..], &sequence[0..offset_compare_length], false, wildcard);
+                let ed = crate::sequence_alignment::wfa_ed_config(&consensus[p..], &sequence[0..offset_compare_length], false, config.wildcard);
                 if ed < min_ed {
                     min_ed = ed;
                     best_offset = p;
                 }
             }
 
-            // now set up the DWFA with the best offset
-            let mut new_dwfa = DWFALite::new(wildcard, allow_early_termination);
+            // now set up the DWFA with the best offset and a cap from this read's length
+            let mut new_dwfa = DWFALite::new(config.dwfa_lite_config_for(sequence.len())?);
             new_dwfa.set_offset(best_offset);
             new_dwfa.update(sequence, consensus)?;
             dwfas[seq_index] = Some(new_dwfa);
@@ -1224,11 +1230,33 @@ impl DualConsensusNode {
                 // assert!(opt_dwfa1.is_some() || opt_dwfa2.is_some());
                 // these can be None if either A) this one has not started or B) it has started, but dropped off due to high ED
                 // in either case, it would default to NOT at end (i.e., false)
-                let p1 = opt_dwfa1.as_ref().map(|d| d.reached_baseline_end(baseline));
-                let p2 = opt_dwfa2.as_ref().map(|d| d.reached_baseline_end(baseline));
+                // a capped DWFA is ignored: it does not count as finished, and it does not block when every read must finish
+                let mut saw_active = false; // true if either DWFA is active
+                let mut at_end = false; // true if saw_active AND it has reached the baseline end
+                for opt_dwfa in [opt_dwfa1, opt_dwfa2] {
+                    if let Some(dwfa) = opt_dwfa.as_ref().filter(|d| d.state() != DWFALiteState::ExceededEditDistanceLimit) {
+                        saw_active = true;
+                        if dwfa.reached_baseline_end(baseline) {
+                            at_end = true;
+                        }
+                    }
+                }
 
-                // at least one of them needs to be at the end to pass; untracked does not count
-                p1.unwrap_or(false) || p2.unwrap_or(false)
+                if saw_active {
+                    // we saw an active DWFA, so return the normal end check result for this sequence
+                    at_end
+                } else {
+                    // we did not see an active DWFA, so we need to check if they are distance capped
+                    let any_capped = [opt_dwfa1, opt_dwfa2].iter().any(|opt| {
+                        opt.as_ref().is_some_and(|d| d.state() == DWFALiteState::ExceededEditDistanceLimit)
+                    });
+
+                    // if the DWFAs are distance capped:
+                    // - if we require all, then we do not want to penalize; so it should be True
+                    // - if not, then we don't want to count it as reached; so it should be False
+                    // the following logic handles this appropriately
+                    any_capped && require_all
+                }
             });
         
         // handle iterator appropriately
@@ -1265,9 +1293,11 @@ impl DualConsensusNode {
         // iterate over each DWFA and check if it's at the end
         let mut iter_map = baseline_sequences.iter().zip(dwfa_iter)
             .map(|(&baseline, opt_dwfa)| {
-                opt_dwfa.as_ref()
-                    .map(|d| d.reached_baseline_end(baseline))
-                    .unwrap_or(value_for_inactive)
+                match opt_dwfa.as_ref() {
+                    Some(dwfa) if dwfa.state() == DWFALiteState::ExceededEditDistanceLimit => require_all,
+                    Some(dwfa) => dwfa.reached_baseline_end(baseline),
+                    None => value_for_inactive,
+                }
             });
         
         if require_all {
@@ -1405,10 +1435,12 @@ mod tests {
     // first some more targeted tests
     #[test]
     fn test_heap_orders_by_priority_then_id() {
+        let sequences: [&[u8]; 1] = [b""];
         let offsets = vec![None];
-        let mut earlier = DualConsensusNode::new_root_node(&offsets, None, false).unwrap();
-        let mut later = DualConsensusNode::new_root_node(&offsets, None, false).unwrap();
-        let mut cheaper = DualConsensusNode::new_root_node(&offsets, None, false).unwrap();
+        let config = CdwfaConfig::default();
+        let mut earlier = DualConsensusNode::new_root_node(&sequences, &offsets, &config).unwrap();
+        let mut later = DualConsensusNode::new_root_node(&sequences, &offsets, &config).unwrap();
+        let mut cheaper = DualConsensusNode::new_root_node(&sequences, &offsets, &config).unwrap();
         earlier.queued_priority = (Reverse(1), 0, Reverse(0));
         later.queued_priority = (Reverse(1), 0, Reverse(1));
         cheaper.queued_priority = (Reverse(0), 0, Reverse(2));
@@ -1432,7 +1464,11 @@ mod tests {
         let sequences: Vec<&[u8]> = vec_sequences.iter().map(|v| v.as_slice()).collect();
         let offsets = vec![None; sequences.len()];
 
-        let mut node = DualConsensusNode::new_root_node(&offsets, None, true).unwrap();
+        let config = CdwfaConfigBuilder::default()
+            .allow_early_termination(true)
+            .build()
+            .unwrap();
+        let mut node = DualConsensusNode::new_root_node(&sequences, &offsets, &config).unwrap();
         node.activate_dual(sequences.as_slice(), b'A', b'C').unwrap();
 
         let weights1 = node.get_ed_weights(true, true);

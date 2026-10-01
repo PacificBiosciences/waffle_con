@@ -2,6 +2,57 @@
 use rustc_hash::FxHashMap as HashMap;
 use simple_error::bail;
 
+/// Lifecycle of a [`DWFALite`].
+/// A DWFA starts [`Active`](DWFALiteState::Active). 
+/// Finalizing it or passing the edit-distance cap moves it out of that state.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum DWFALiteState {
+    /// The DWFA can still be extended.
+    #[default]
+    Active,
+    /// `finalize` has completed and the DWFA can no longer be extended.
+    Finalized,
+    /// Another edit would pass `max_edit_distance`. The distance stays at the cap and this DWFA stops voting.
+    ExceededEditDistanceLimit,
+}
+
+/// Fixed options for a [`DWFALite`].
+/// These values are chosen when the DWFA is constructed and do not change as it is extended.
+///
+/// ```
+/// use waffle_con::dynamic_wfa::{DWFALite, DWFALiteConfigBuilder};
+/// let config = DWFALiteConfigBuilder::default()
+///     .wildcard(Some(b'N'))
+///     .allow_early_termination(true)
+///     .max_edit_distance(Some(500))
+///     .build()
+///     .unwrap();
+/// let dwfa = DWFALite::new(config);
+/// assert_eq!(dwfa.max_edit_distance(), Some(500));
+/// ```
+#[derive(derive_builder::Builder, Clone, Debug, Eq, Hash, PartialEq)]
+#[builder(default)]
+pub struct DWFALiteConfig {
+    /// Optional wildcard symbol that matches anything.
+    pub wildcard: Option<u8>,
+    /// When true, reaching the end of the baseline does not penalize a longer other sequence.
+    pub allow_early_termination: bool,
+    /// Absolute edit-distance cap. `None` means unlimited.
+    pub max_edit_distance: Option<usize>,
+}
+
+// explicitly set our default for now, even if it's derivable
+#[allow(clippy::derivable_impls)]
+impl Default for DWFALiteConfig {
+    fn default() -> Self {
+        DWFALiteConfig {
+            wildcard: None,
+            allow_early_termination: false,
+            max_edit_distance: None,
+        }
+    }
+}
+
 /// The core dynamic WFA structure for a lite implementation.
 /// It is structured such that all the sequences being built are maintained **outside** of this struct (hence the "lite").
 /// Essentially, it is keep the wavefront information, but all sequences are updated and tracked elsewhere.
@@ -11,6 +62,10 @@ use simple_error::bail;
 /// This means each character we add to `other_seq` will add a new _column_ to the grid.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct DWFALite {
+    /// Fixed matching and edit-distance options for this DWFA.
+    config: DWFALiteConfig,
+    /// Whether this DWFA is still active, finalized, or frozen at its edit-distance cap.
+    state: DWFALiteState,
     /// The minimum edit distance from `other_seq` to `baseline_seq` allowing for a large port of the tail of the `baseline_seq` to get ignored.
     edit_distance: usize,
     /// This is the core wavefront for the current `edit_distance`.
@@ -21,38 +76,30 @@ pub struct DWFALite {
     /// The value stored will always be the number of bases consumed in `other_seq`.
     /// After a proper character addition, _at least one_ of these should always equal the length of `other_seq` - `offset`.
     wavefront: Vec<usize>,
-    /// If true, this DWFA has been finalized, meaning it cannot be extended anymore.
-    is_finalized: bool,
-    /// Sets an optional wildcard symbol that will match anything
-    wildcard: Option<u8>,
-    /// Allows the algorithm to terminate when it reaches the end of the baseline_seq
-    allow_early_termination: bool,
     // this is an offset into `other_seq` that the baseline starts
-    offset: usize
+    offset: usize,
 }
 
 impl Default for DWFALite {
     fn default() -> Self {
         DWFALite {
+            config: DWFALiteConfig::default(),
+            state: DWFALiteState::Active,
             edit_distance: 0,
             wavefront: vec![0],
-            is_finalized: false,
-            wildcard: None,
-            allow_early_termination: false,
-            offset: 0
+            offset: 0,
         }
     }
 }
     
 
 impl DWFALite {
-    /// Creates a new dynamic WFA instance with user-provided options
+    /// Creates a new dynamic WFA instance from fixed options.
     /// # Arguments
-    /// `wildcard` - a known wildcard symbol that will match anything
-    pub fn new(wildcard: Option<u8>, allow_early_termination: bool) -> DWFALite {
+    /// * `config` - wildcard, early termination, and the absolute edit-distance cap
+    pub fn new(config: DWFALiteConfig) -> DWFALite {
         DWFALite {
-            wildcard,
-            allow_early_termination,
+            config,
             ..Default::default()
         }
     }
@@ -73,8 +120,10 @@ impl DWFALite {
     /// # Errors
     /// * If this function is called after `finalize()` has been called.
     pub fn update(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Result<usize, Box<dyn std::error::Error>> {
-        if self.is_finalized {
-            bail!("Cannot push more bases after finalizing a DWFA");
+        match self.state {
+            DWFALiteState::Finalized => bail!("Cannot push more bases after finalizing a DWFA"),
+            DWFALiteState::ExceededEditDistanceLimit => return Ok(self.edit_distance),
+            DWFALiteState::Active => {}
         }
 
         // maximally extend everything along the current diagonals
@@ -82,7 +131,12 @@ impl DWFALite {
         
         // check how it looks
         let mut maximum_distance = self.maximum_other_distance();
-        while maximum_distance < other_seq.len() && !(self.allow_early_termination && self.reached_baseline_end(baseline_seq)){
+        while maximum_distance < other_seq.len() && !(self.config.allow_early_termination && self.reached_baseline_end(baseline_seq)){
+            if self.edit_distance_at_limit() {
+                // another edit would pass the cap; freeze and stop contributing
+                self.state = DWFALiteState::ExceededEditDistanceLimit;
+                return Ok(self.edit_distance);
+            }
             // increase the edit distance, re-extension happens automatically
             self.increase_edit_distance(baseline_seq, other_seq)?;
 
@@ -93,7 +147,7 @@ impl DWFALite {
         // final assertion just to make sure we don't break anything
         assert!(
             maximum_distance == other_seq.len() || 
-            (self.allow_early_termination && self.maximum_baseline_distance() == baseline_seq.len())
+            (self.config.allow_early_termination && self.maximum_baseline_distance() == baseline_seq.len())
         );
         Ok(self.edit_distance)
     }
@@ -107,10 +161,6 @@ impl DWFALite {
     /// # Errors
     /// * None so far
     fn extend(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-        // this is easier logic than trying to handle the option syntax below
-        let is_wildcard_disabled = self.wildcard.is_none();
-        let wildcard = self.wildcard.unwrap_or_default();
-
         for (i, d) in self.wavefront.iter_mut().enumerate() {
             // `i` is the index in the wavefront
             // `i // 2` is always the middle diagonal
@@ -136,8 +186,8 @@ impl DWFALite {
                     (
                         // not equal 
                         baseline_seq[baseline_offset] != other_seq[other_offset] && 
-                        // AND (wildcards are disable OR baseline != wildcard)
-                        (is_wildcard_disabled || baseline_seq[baseline_offset] != wildcard)
+                        // AND baseline is not the configured wildcard
+                        !self.config.wildcard.is_some_and(|wildcard| baseline_seq[baseline_offset] == wildcard)
                     ) {
                     // if we are past the end of either sequence OR
                     // the sequences are not equal at this position THEN
@@ -160,8 +210,10 @@ impl DWFALite {
     /// # Errors
     /// * If the DWFA is already finalized
     fn increase_edit_distance(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-        if self.is_finalized {
-            bail!("Cannot increase edit distance after finalizing a DWFA");
+        match self.state {
+            DWFALiteState::Active => {}
+            DWFALiteState::Finalized => bail!("Cannot increase edit distance after finalizing a DWFA"),
+            DWFALiteState::ExceededEditDistanceLimit => bail!("Cannot increase edit distance after exceeding the edit distance limit"),
         }
         // first, increase the distance we're at
         self.edit_distance += 1;
@@ -199,14 +251,26 @@ impl DWFALite {
     /// # Errors
     /// * If the edit distance cannot be increased further and it needs to be.
     pub fn finalize(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-        if self.is_finalized {
-            bail!("Cannot finalize a DWFA twice.");
+        match self.state {
+            DWFALiteState::Finalized => bail!("Cannot finalize a DWFA twice."),
+            DWFALiteState::ExceededEditDistanceLimit => return Ok(()),
+            DWFALiteState::Active => {}
         }
         while self.maximum_baseline_distance() < baseline_seq.len() {
+            if self.edit_distance_at_limit() {
+                self.state = DWFALiteState::ExceededEditDistanceLimit;
+                return Ok(());
+            }
             // while we have not reached the end of the primary sequence
             self.increase_edit_distance(baseline_seq, other_seq)?;
         }
+        self.state = DWFALiteState::Finalized;
         Ok(())
+    }
+
+    /// True when the next edit would pass the cap resolved at construction.
+    fn edit_distance_at_limit(&self) -> bool {
+        self.config.max_edit_distance.is_some_and(|limit| self.edit_distance >= limit)
     }
 
     /// Helper function that will determine the farthest distance reached into the `baseline_seq` so far.
@@ -220,7 +284,7 @@ impl DWFALite {
     }
 
     /// Helper function that will determine the farthest distance reached into the `other_seq` so far.
-    /// After a public function call, this should _always_ be the `other_seq` length.
+    /// After a public function call, this should be the `other_seq` length unless the edit-distance limit was reached.
     pub fn maximum_other_distance(&self) -> usize {
         // other distance is directly tracked in our wavefront
         self.offset + *self.wavefront.iter().max().unwrap()
@@ -239,6 +303,9 @@ impl DWFALite {
     /// * `baseline_seq` - the baseline sequence, theoretically fixed
     /// * `other_seq` - the other sequence, typically getting updates
     pub fn get_extension_candidates(&self, baseline_seq: &[u8], other_seq: &[u8]) -> HashMap<u8, usize> {
+        if self.state == DWFALiteState::ExceededEditDistanceLimit {
+            return Default::default();
+        }
         let mut ret: HashMap<u8, usize> = Default::default();
         for (i, &d) in self.wavefront.iter().enumerate() {
             let other_offset = d + self.offset;
@@ -262,11 +329,39 @@ impl DWFALite {
     pub fn wavefront(&self) -> &[usize] {
         &self.wavefront
     }
+
+    pub fn max_edit_distance(&self) -> Option<usize> {
+        self.config.max_edit_distance
+    }
+
+    pub fn state(&self) -> DWFALiteState {
+        self.state
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cdwfa_config::CdwfaConfig;
+
+    fn dwfa_config(wildcard: Option<u8>, allow_early_termination: bool, max_edit_distance: Option<usize>) -> DWFALiteConfig {
+        DWFALiteConfigBuilder::default()
+            .wildcard(wildcard)
+            .allow_early_termination(allow_early_termination)
+            .max_edit_distance(max_edit_distance)
+            .build()
+            .unwrap()
+    }
+
+    /// Resolves a consensus cap and stores that absolute maximum on a new DWFA.
+    fn dwfa_with_consensus_cap(baseline_len: usize, hard_max: Option<usize>, fraction: Option<f64>) -> Result<DWFALite, Box<dyn std::error::Error>> {
+        let max_edit_distance = CdwfaConfig {
+            max_edit_distance: hard_max,
+            max_edit_distance_fraction: fraction,
+            ..Default::default()
+        }.max_edit_distance_for(baseline_len)?;
+        Ok(DWFALite::new(dwfa_config(None, false, max_edit_distance)))
+    }
 
     #[test]
     fn test_new() {
@@ -426,7 +521,7 @@ mod tests {
         let consensus= b"AACGGATCAAGCTTACCAGTATTTACGT";
         let baseline = b"*ACGGATCAA**TTACCA*TATTTACG*";
         
-        let mut dwfa = DWFALite::new(Some(b'*'), false);
+        let mut dwfa = DWFALite::new(dwfa_config(Some(b'*'), false, None));
         dwfa.update(baseline, consensus).unwrap();
         assert_eq!(dwfa.edit_distance(), 0);
     }
@@ -437,7 +532,7 @@ mod tests {
         let consensus= b"AACGGATCAAGCTTACCAGTATTTACGT";
         let baseline = b"*ACGATCAA**TATACCA*TATCTACG*";
         
-        let mut dwfa = DWFALite::new(Some(b'*'), false);
+        let mut dwfa = DWFALite::new(dwfa_config(Some(b'*'), false, None));
         dwfa.update(baseline, consensus).unwrap();
         assert_eq!(dwfa.edit_distance(), 3);
     }
@@ -446,7 +541,7 @@ mod tests {
     fn test_early_termination_001() {
         let consensus = b"ACGTACGT";
         let baseline = b"ACGT";
-        let mut dwfa = DWFALite::new(None, true);
+        let mut dwfa = DWFALite::new(dwfa_config(None, true, None));
         dwfa.update(baseline, consensus).unwrap();
         assert_eq!(dwfa.edit_distance(), 0);
     }
@@ -457,7 +552,7 @@ mod tests {
         let seq_23 = "AGCCCATTCTGGCCCCTTCCCCACATGCCAGGACAATGTAGTCCTTGTCACCAATCTGGGCAGTCAGAGTTGGGTCAGTGGGGGACATGGGATTATGGGCAAGGGTAACTGACATCTGCTCAGCCTCAACGTACCCGTCTCAAATGCGGCCAGGCGGTGGGGTAAGCAGGAATGAGGCAGGGGTGGGGTTGCCCTGAGGAGGATGATCCCAACGAGGGCGTGAGCAGGGGACCCGAGTTGGAACTACCACATTGCTTTATTGTACATTAGAGCCTCTGGCTAGGGAGCAGGCTGGGGACTAGGTACCCCATTCTAGCGGGGCACAGCACAAAGCTCGTAGGGGGATGGGGTCACCAGAAAGCTGACGACACGAGAGTGGCTGGGCCGGGGCTGTCCGGCGGCCACGGAGAAGCTGAAGTGCTGCAGCAGGGAGGTGAAGAAGAGGAAGAGCTCCATGCGGGCCAGGGGCTCCCCGAGGCATGCACGGCGGCCTGTGGGGAGGGGAGGGGCGTCAGTGAGCCTGGCTCCTGGGTGATACCCCTGCAAGACTCCACGGAAGGGGACAGGGAGCCGGGCTCCCCACAGGCACCTGCTGAGAAAGGCAGGAAGGCCTCCGGCTTCACAAAGTGGCCCTGGGCATCCAGGAAGTGT";
 
         // iterate, making sure everything is fine even as we go well beyond seq_23
-        let mut dwfa = DWFALite::new(None, true);
+        let mut dwfa = DWFALite::new(dwfa_config(None, true, None));
         for i in 0..c1.len() {
             dwfa.update(seq_23.as_bytes(), c1[0..(i+1)].as_bytes()).unwrap();
             assert!(dwfa.edit_distance() <= 2);
@@ -475,9 +570,60 @@ mod tests {
         // this sequence
         let consensus = b"ACGTACGT";
         let baseline =    b"GTACGT";
-        let mut dwfa = DWFALite::new(None, true);
+        let mut dwfa = DWFALite::new(dwfa_config(None, true, None));
         dwfa.set_offset(2);
         dwfa.update(baseline, consensus).unwrap();
         assert_eq!(dwfa.edit_distance(), 0);
+    }
+
+    #[test]
+    fn test_exact_match_under_edit_distance_cap() {
+        let sequence = b"ACGTACGT";
+        let mut dwfa = dwfa_with_consensus_cap(sequence.len(), Some(2), None).unwrap();
+        let other = &sequence[..4];
+        assert_eq!(dwfa.update(sequence, other).unwrap(), 0);
+        assert_eq!(dwfa.get_extension_candidates(sequence, other).get(&b'A'), Some(&1));
+        assert_eq!(dwfa.state(), DWFALiteState::Active);
+    }
+
+    #[test]
+    fn test_hard_edit_distance_cap() {
+        let baseline = b"ACGTACGTACGT";
+        let other = b"TTTTTTTTTTTT";
+        let mut dwfa = dwfa_with_consensus_cap(baseline.len(), Some(3), None).unwrap();
+        assert_eq!(dwfa.update(baseline, other).unwrap(), 3);
+        assert_eq!(dwfa.state(), DWFALiteState::ExceededEditDistanceLimit);
+        assert!(dwfa.get_extension_candidates(baseline, other).is_empty());
+
+        let mut longer = other.to_vec();
+        longer.push(b'A');
+        assert_eq!(dwfa.update(baseline, &longer).unwrap(), 3);
+        dwfa.finalize(baseline, &longer).unwrap();
+        assert_eq!(dwfa.edit_distance(), 3);
+        assert!(dwfa.get_extension_candidates(baseline, &longer).is_empty());
+    }
+
+    #[test]
+    fn test_fractional_edit_distance_cap() {
+        let baseline = vec![b'A'; 100];
+        let mut other = vec![b'T'; 6];
+        other.extend(std::iter::repeat(b'A').take(94));
+        let mut dwfa = dwfa_with_consensus_cap(baseline.len(), None, Some(0.05)).unwrap();
+        assert_eq!(dwfa.max_edit_distance(), Some(5));
+        assert_eq!(dwfa.update(&baseline, &other).unwrap(), 5);
+        assert_eq!(dwfa.state(), DWFALiteState::ExceededEditDistanceLimit);
+        assert!(dwfa.get_extension_candidates(&baseline, &other).is_empty());
+    }
+
+    #[test]
+    fn test_edit_distance_cap_uses_tighter_limit() {
+        let tighter_hard = dwfa_with_consensus_cap(100, Some(3), Some(0.05)).unwrap();
+        assert_eq!(tighter_hard.max_edit_distance(), Some(3));
+        let tighter_fraction = dwfa_with_consensus_cap(100, Some(10), Some(0.05)).unwrap();
+        assert_eq!(tighter_fraction.max_edit_distance(), Some(5));
+        let unlimited = dwfa_with_consensus_cap(100, None, None).unwrap();
+        assert_eq!(unlimited.max_edit_distance(), None);
+        assert!(dwfa_with_consensus_cap(100, None, Some(-0.1)).is_err());
+        assert!(dwfa_with_consensus_cap(100, None, Some(f64::NAN)).is_err());
     }
 }

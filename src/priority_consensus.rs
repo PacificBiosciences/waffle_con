@@ -58,7 +58,7 @@ use simple_error::bail;
 
 use crate::cdwfa_config::{CdwfaConfig, ConsensusCost};
 use crate::consensus::Consensus;
-use crate::dual_consensus::DualConsensusDWFA;
+use crate::dual_consensus::{DualConsensusDWFA, SequenceAssignment};
 
 /// Contains a final multi-consensus result
 #[derive(Debug, PartialEq)]
@@ -242,7 +242,7 @@ impl<'a> PriorityConsensusDWFA<'a> {
                     } else {
                         usize::MAX
                     };
-                    debug!("\tseq_{i} => {s1} | {s2} => is_ci = {}; {:?} | {:?}", chosen_result.is_consensus1()[ic_index], chosen_result.scores1()[ic_index], chosen_result.scores2()[ic_index]);
+                    debug!("\tseq_{i} => {s1} | {s2} => assignment = {:?}; {:?} | {:?}", chosen_result.assignments()[ic_index], chosen_result.scores1()[ic_index], chosen_result.scores2()[ic_index]);
                     ic_index += 1;
                     /*
                     if i == index1 || i == index2 {
@@ -255,8 +255,8 @@ impl<'a> PriorityConsensusDWFA<'a> {
 
             if chosen_result.is_dual() {
                 // consensus sequences actually don't matter at this point, we only care about how they were split
-                let is_c1 = chosen_result.is_consensus1();
-                let mut is_c1_index: usize = 0;
+                let read_assignments = chosen_result.assignments();
+                let mut assignment_index: usize = 0;
 
                 // these are the new clusters
                 let mut assign1 = vec![false; self.sequences.len()];
@@ -265,18 +265,19 @@ impl<'a> PriorityConsensusDWFA<'a> {
                 for (i, &included) in include_set.iter().enumerate() {
                     if included {
                         // this one was part of the include_set
-                        if is_c1[is_c1_index] {
-                            // this one should go to the first one
-                            assign1[i] = true;
-                        } else {
-                            assign2[i] = true;
+                        match read_assignments[assignment_index] {
+                            SequenceAssignment::Consensus2 => assign2[i] = true,
+                            // TODO: EditDistanceLimit reads could form a third group instead of joining allele 1.
+                            SequenceAssignment::Consensus1
+                            | SequenceAssignment::EqualScore
+                            | SequenceAssignment::EditDistanceLimit => assign1[i] = true,
                         }
-                        is_c1_index += 1;
+                        assignment_index += 1;
                     }
                 }
 
                 // make sure we have written the correct number of things
-                assert_eq!(is_c1.len(), is_c1_index);
+                assert_eq!(read_assignments.len(), assignment_index);
 
                 // now add both new sets for re-splitting
                 to_split.push(assign1);

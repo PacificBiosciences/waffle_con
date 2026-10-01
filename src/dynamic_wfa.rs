@@ -121,10 +121,12 @@ impl DWFALite {
     /// * If this function is called after `finalize()` has been called.
     pub fn update(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Result<usize, Box<dyn std::error::Error>> {
         match self.state {
-            DWFALiteState::Finalized => bail!("Cannot push more bases after finalizing a DWFA"),
+            DWFALiteState::Finalized => {
+                bail!("Cannot push more bases after finalizing a DWFA");
+            },
             DWFALiteState::ExceededEditDistanceLimit => return Ok(self.edit_distance),
             DWFALiteState::Active => {}
-        }
+        };
 
         // maximally extend everything along the current diagonals
         self.extend(baseline_seq, other_seq)?;
@@ -211,10 +213,15 @@ impl DWFALite {
     /// * If the DWFA is already finalized
     fn increase_edit_distance(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
         match self.state {
-            DWFALiteState::Active => {}
-            DWFALiteState::Finalized => bail!("Cannot increase edit distance after finalizing a DWFA"),
-            DWFALiteState::ExceededEditDistanceLimit => bail!("Cannot increase edit distance after exceeding the edit distance limit"),
-        }
+            DWFALiteState::Active => {},
+            DWFALiteState::Finalized => {
+                bail!("Cannot increase edit distance after finalizing a DWFA");
+            },
+            DWFALiteState::ExceededEditDistanceLimit => {
+                bail!("Cannot increase edit distance after exceeding the edit distance limit");
+            },
+        };
+
         // first, increase the distance we're at
         self.edit_distance += 1;
 
@@ -252,10 +259,12 @@ impl DWFALite {
     /// * If the edit distance cannot be increased further and it needs to be.
     pub fn finalize(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
         match self.state {
-            DWFALiteState::Finalized => bail!("Cannot finalize a DWFA twice."),
+            DWFALiteState::Finalized => {
+                bail!("Cannot finalize a DWFA twice.");
+            },
             DWFALiteState::ExceededEditDistanceLimit => return Ok(()),
-            DWFALiteState::Active => {}
-        }
+            DWFALiteState::Active => {},
+        };
         while self.maximum_baseline_distance() < baseline_seq.len() {
             if self.edit_distance_at_limit() {
                 self.state = DWFALiteState::ExceededEditDistanceLimit;

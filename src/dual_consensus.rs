@@ -6,7 +6,7 @@ Note that it can also generate a single consensus if no splits are identified.
 # Example usage
 ```rust
 use waffle_con::consensus::Consensus;
-use waffle_con::dual_consensus::DualConsensusDWFA;
+use waffle_con::dual_consensus::{DualConsensusDWFA, SequenceAssignment};
 use waffle_con::cdwfa_config::ConsensusCost;
 
 let sequences = [
@@ -31,7 +31,16 @@ let consensuses = cdwfa.consensus().unwrap();
 assert_eq!(consensuses.len(), 1);
 assert_eq!(consensuses[0].consensus1(), &Consensus::new(sequences[1].clone(), ConsensusCost::L1Distance, vec![1, 0, 0, 1]));
 assert_eq!(consensuses[0].consensus2().unwrap(), &Consensus::new(sequences[6].clone(), ConsensusCost::L1Distance, vec![1, 1, 0, 0]));
-assert_eq!(consensuses[0].is_consensus1(), &[true, true, true, true, false, false, false, false]);
+assert_eq!(consensuses[0].assignments(), &[
+    SequenceAssignment::Consensus1,
+    SequenceAssignment::Consensus1,
+    SequenceAssignment::Consensus1,
+    SequenceAssignment::Consensus1,
+    SequenceAssignment::Consensus2,
+    SequenceAssignment::Consensus2,
+    SequenceAssignment::Consensus2,
+    SequenceAssignment::Consensus2,
+]);
 ```
 */
 
@@ -51,15 +60,41 @@ use crate::pqueue_tracker::PQueueTracker;
 /// Lower cost, then longer consensus, then an earlier tie-breaker.
 type NodePriority = (Reverse<usize>, usize, Reverse<u64>);
 
+/// Which allele a read belongs to after a dual consensus.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SequenceAssignment {
+    /// The read is closer to consensus 1.
+    Consensus1,
+    /// The read is closer to consensus 2.
+    Consensus2,
+    /// Both alleles are tracked and have the same score, and they are not both past the edit-distance cap.
+    EqualScore,
+    /// Both tracked alleles reached the edit-distance cap.
+    EditDistanceLimit,
+}
+
+impl SequenceAssignment {
+    /// Flips allele 1 and allele 2. Ties and double failures are unchanged.
+    fn swap_alleles(self) -> Self {
+        match self {
+            SequenceAssignment::Consensus1 => SequenceAssignment::Consensus2,
+            SequenceAssignment::Consensus2 => SequenceAssignment::Consensus1,
+            other => other,
+        }
+    }
+}
+
 /// Contains a final multi-consensus result
 #[derive(Debug)]
 pub struct DualConsensus {
-    /// The first consensus
+    /// The first consensus.
+    /// Internal `scores` tracks only reads assigned to this allele. `EqualScore` and `EditDistanceLimit` reads are not tracked.
     consensus1: Consensus,
-    /// The second consensus - this one can be optional when only one consensus is identified
+    /// The second consensus. This is `None` when only one consensus is identified.
+    /// Internal `scores` tracks only reads assigned to this allele. `EqualScore` and `EditDistanceLimit` reads are not tracked.
     consensus2: Option<Consensus>,
-    /// same length as input sequences; for each entry, if True, then the corresponding input sequence matches consensus #1; otherwise, it matches #2
-    is_consensus1: Vec<bool>,
+    /// One entry per input sequence: allele 1, allele 2, a score tie, or both alleles past the edit-distance cap.
+    assignments: Vec<SequenceAssignment>,
     /// The scores when compared to consensus1, will be None if it stopped tracking
     scores1: Vec<Option<usize>>,
     /// The scores when compared to consensus2, will be None if it stopped tracking
@@ -70,7 +105,7 @@ impl PartialEq for DualConsensus {
     fn eq(&self, other: &Self) -> bool {
         self.consensus1 == other.consensus1 && 
             self.consensus2 == other.consensus2 && 
-            self.is_consensus1 == other.is_consensus1 
+            self.assignments == other.assignments 
 
             // for now, we do not care about these in the impl
             //&& self.scores1 == other.scores1 && self.scores2 == other.scores2
@@ -81,17 +116,17 @@ impl DualConsensus {
     /// Generic constructor for outside usage. This does not force consensus order like `from_node(...)`.
     pub fn new(
         consensus1: Consensus, consensus2: Option<Consensus>, 
-        is_consensus1: Vec<bool>, scores1: Vec<Option<usize>>, scores2: Vec<Option<usize>>
+        assignments: Vec<SequenceAssignment>, scores1: Vec<Option<usize>>, scores2: Vec<Option<usize>>
     ) -> Result<Self, SimpleError> {
 
-        if is_consensus1.len() != scores1.len() || is_consensus1.len() != scores2.len() {
-            bail!("is_consensus1, scores1, and scores2 must all be the same length");
+        if assignments.len() != scores1.len() || assignments.len() != scores2.len() {
+            bail!("assignments, scores1, and scores2 must all be the same length");
         }
 
         Ok(Self {
             consensus1,
             consensus2,
-            is_consensus1,
+            assignments,
             scores1,
             scores2,
         })
@@ -103,24 +138,23 @@ impl DualConsensus {
     /// * `finalized_node` - the node that we are converting to a consensus
     /// * `consensus_cost` - the cost model that gets propated
     fn from_node(finalized_node: &DualConsensusNode, consensus_cost: ConsensusCost) -> DualConsensus {
-        // figure out the best consensus and score for each read; note that this assumes no ties
-        let (best_consensus_index, best_consensus_score) = finalized_node.costs(consensus_cost);
-
         // check if we need to swap the order
         let swap_order = finalized_node.is_dual && (finalized_node.consensus2 < finalized_node.consensus1);
 
         // now reformat the above information such that we can build out the multi-consensus return values
-        let mut is_consensus1: Vec<bool> = Default::default();
+        let (full1, full2) = finalized_node.full_cost(consensus_cost);
+        let mut assignments = Vec::with_capacity(finalized_node.dwfas1.len());
         let mut consensus_scores: Vec<Vec<usize>> = vec![vec![]; 2];
-        for (best_con_index, best_con_score) in best_consensus_index.into_iter()
-            .zip(best_consensus_score) {
-            // these MUST be equal length
-            // store that this sequence index matches the particular consensus index
-            assert!(best_con_index <= 1);
-            // toggle the consensus assignment if we swap_order
-            is_consensus1.push((best_con_index == 0) ^ swap_order);
-            // also store this score for this consensus index
-            consensus_scores[best_con_index].push(best_con_score);
+        for seq_index in 0..finalized_node.dwfas1.len() {
+            let internal = finalized_node.read_assignment(seq_index, consensus_cost);
+            // only reads assigned to an allele contribute to that allele's score list
+            match internal {
+                SequenceAssignment::Consensus1 => consensus_scores[0].push(full1[seq_index].expect("assigned consensus is tracked")),
+                SequenceAssignment::Consensus2 => consensus_scores[1].push(full2[seq_index].expect("assigned consensus is tracked")),
+                SequenceAssignment::EqualScore | SequenceAssignment::EditDistanceLimit => {}
+            }
+            // assignments are swapped as we add them if needed
+            assignments.push(if swap_order { internal.swap_alleles() } else { internal });
         }
 
         // now we can store the consensus sequences as well as the corresponding indices in the final output
@@ -136,17 +170,16 @@ impl DualConsensus {
         };
 
         // now save the scores also
-        let (s1, s2) = finalized_node.full_cost(consensus_cost);
         let (scores1, scores2) = if swap_order {
-            (s2, s1)
+            (full2, full1)
         } else {
-            (s1, s2)
+            (full1, full2)
         };
 
         DualConsensus {
             consensus1,
             consensus2,
-            is_consensus1,
+            assignments,
             scores1,
             scores2
         }
@@ -166,8 +199,8 @@ impl DualConsensus {
         self.consensus2.as_ref()
     }
 
-    pub fn is_consensus1(&self) -> &[bool] {
-        &self.is_consensus1
+    pub fn assignments(&self) -> &[SequenceAssignment] {
+        &self.assignments
     }
 
     pub fn scores1(&self) -> &[Option<usize>] {
@@ -1179,6 +1212,35 @@ impl DualConsensusNode {
         (best_consensus_index, best_consensus_score)
     }
 
+    /// Labels one read from the two tracked DWFAs, before any alphabetical allele swap.
+    fn read_assignment(&self, seq_index: usize, consensus_cost: ConsensusCost) -> SequenceAssignment {
+        // helper functions to get the score and state of a DWFA
+        let score = |dwfa: &DWFALite| match consensus_cost {
+            ConsensusCost::L1Distance => dwfa.edit_distance(),
+            ConsensusCost::L2Distance => dwfa.edit_distance().pow(2),
+        };
+        let exceeded = |dwfa: &DWFALite| dwfa.state() == DWFALiteState::ExceededEditDistanceLimit;
+
+        // first, match on the existence of the DWFAs
+        match (self.dwfas1[seq_index].as_ref(), self.dwfas2[seq_index].as_ref()) {
+            (Some(_), None) => SequenceAssignment::Consensus1,
+            (None, Some(_)) => SequenceAssignment::Consensus2,
+            // both exist, so now match on if either or both are exceeded
+            (Some(first), Some(second)) => match (exceeded(first), exceeded(second)) {
+                (true, true) => SequenceAssignment::EditDistanceLimit,
+                (true, false) => SequenceAssignment::Consensus2,
+                (false, true) => SequenceAssignment::Consensus1,
+                // both are not exceeded, so final comparison on the actual exact scores
+                (false, false) => match score(first).cmp(&score(second)) {
+                    Ordering::Equal => SequenceAssignment::EqualScore,
+                    Ordering::Less => SequenceAssignment::Consensus1,
+                    Ordering::Greater => SequenceAssignment::Consensus2,
+                },
+            },
+            (None, None) => panic!("Finalize produced a sequence with no DWFA"),
+        }
+    }
+
     /// Returns the total score for the node
     fn total_cost(&self, consensus_cost: ConsensusCost) -> usize {
         let (_best_indices, best_costs) = self.costs(consensus_cost);
@@ -1500,7 +1562,7 @@ mod tests {
     /// * `cost_mode` - the cost mode getting tested
     fn load_dual_csv_test(filename: &std::path::Path, include_consensus: bool, cost_mode: ConsensusCost) -> (Vec<Vec<u8>>, DualConsensus) {
         let mut sequences = vec![];
-        let mut is_consensus1 = vec![];
+        let mut assignments = vec![];
         let mut ed1 = vec![];
         let mut ed2 = vec![];
 
@@ -1541,7 +1603,11 @@ mod tests {
                 ed2.push(edits);
             }
 
-            is_consensus1.push(is_con1);
+            assignments.push(if is_con1 {
+                SequenceAssignment::Consensus1
+            } else {
+                SequenceAssignment::Consensus2
+            });
             sequences.push(sequence);
         }
 
@@ -1553,7 +1619,7 @@ mod tests {
         let consensus = DualConsensus {
             consensus1,
             consensus2,
-            is_consensus1,
+            assignments,
             scores1: vec![None; sequences.len()],
             scores2: vec![None; sequences.len()]
         };
@@ -1608,7 +1674,7 @@ mod tests {
                 vec![0]
             ),
             consensus2: None,
-            is_consensus1: vec![true],
+            assignments: vec![SequenceAssignment::Consensus1],
             // these are not checked
             scores1: vec![],
             scores2: vec![]
@@ -1640,7 +1706,7 @@ mod tests {
                 vec![0, 0, 1]
             ),
             consensus2: None,
-            is_consensus1: vec![true, true, true],
+            assignments: vec![SequenceAssignment::Consensus1; 3],
             // these are not checked
             scores1: vec![],
             scores2: vec![]
@@ -1675,7 +1741,7 @@ mod tests {
         assert_eq!(consensus, vec![DualConsensus {
             consensus1: Consensus::new(expected_consensus.to_vec(), ConsensusCost::L1Distance, vec![2, 2, 1]),
             consensus2: None,
-            is_consensus1: vec![true; 3],
+            assignments: vec![SequenceAssignment::Consensus1; 3],
             // these are not checked
             scores1: vec![],
             scores2: vec![]
@@ -1713,7 +1779,7 @@ mod tests {
         assert_eq!(consensus, vec![DualConsensus {
             consensus1: Consensus::new(expected_consensus.to_vec(), ConsensusCost::L1Distance, vec![1, 1, 0]),
             consensus2: None,
-            is_consensus1: vec![true; 3],
+            assignments: vec![SequenceAssignment::Consensus1; 3],
             // these are not checked
             scores1: vec![],
             scores2: vec![]
@@ -1752,7 +1818,7 @@ mod tests {
         assert_eq!(consensus, vec![DualConsensus {
             consensus1: Consensus::new(actual_consensus.to_vec(), ConsensusCost::L1Distance, vec![1, 0, 1]),
             consensus2: None,
-            is_consensus1: vec![true; 3],
+            assignments: vec![SequenceAssignment::Consensus1; 3],
             // these are not checked
             scores1: vec![],
             scores2: vec![]
@@ -1779,11 +1845,44 @@ mod tests {
         assert_eq!(consensus, vec![DualConsensus {
             consensus1: Consensus::new(sequence.to_vec(), ConsensusCost::L1Distance, vec![0]),
             consensus2: Some(Consensus::new(alt_sequence.to_vec(), ConsensusCost::L1Distance, vec![0])),
-            is_consensus1: vec![true, false],
+            assignments: vec![SequenceAssignment::Consensus1, SequenceAssignment::Consensus2],
             // these are not checked
             scores1: vec![],
             scores2: vec![]
         }]);
+    }
+
+    #[test]
+    fn test_edit_distance_limit_on_both_alleles() {
+        let allele1 = b"AAAAAAAA";
+        let allele2 = b"CCCCCCCC";
+        let outlier = b"TTTTTTTT";
+        let mut consensus_dwfa = DualConsensusDWFA::with_config(
+            CdwfaConfigBuilder::default()
+                .min_count(2)
+                .max_edit_distance(Some(1))
+                .build().unwrap()
+        ).unwrap();
+        consensus_dwfa.add_sequence(allele1).unwrap();
+        consensus_dwfa.add_sequence(allele1).unwrap();
+        consensus_dwfa.add_sequence(allele2).unwrap();
+        consensus_dwfa.add_sequence(allele2).unwrap();
+        consensus_dwfa.add_sequence(outlier).unwrap();
+
+        let consensus = consensus_dwfa.consensus().unwrap();
+        assert_eq!(consensus.len(), 1);
+        assert_eq!(consensus[0].consensus1().sequence(), allele1);
+        assert_eq!(consensus[0].consensus2().unwrap().sequence(), allele2);
+        assert_eq!(consensus[0].assignments(), &[
+            SequenceAssignment::Consensus1,
+            SequenceAssignment::Consensus1,
+            SequenceAssignment::Consensus2,
+            SequenceAssignment::Consensus2,
+            SequenceAssignment::EditDistanceLimit,
+        ]);
+        // the outlier is omitted from both allele score lists
+        assert_eq!(consensus[0].consensus1().scores(), &[0, 0]);
+        assert_eq!(consensus[0].consensus2().unwrap().scores(), &[0, 0]);
     }
 
     #[test]
@@ -1806,7 +1905,7 @@ mod tests {
         assert_eq!(consensus, vec![DualConsensus {
             consensus1: Consensus::new(sequence.to_vec(), ConsensusCost::L1Distance, vec![0]),
             consensus2: Some(Consensus::new(alt_sequence.to_vec(), ConsensusCost::L1Distance, vec![0])),
-            is_consensus1: vec![true, false],
+            assignments: vec![SequenceAssignment::Consensus1, SequenceAssignment::Consensus2],
             // these are not checked
             scores1: vec![],
             scores2: vec![]
@@ -1833,7 +1932,7 @@ mod tests {
         assert_eq!(consensus, vec![DualConsensus {
             consensus1: Consensus::new(sequence.to_vec(), ConsensusCost::L1Distance, vec![0]),
             consensus2: Some(Consensus::new(alt_sequence.to_vec(), ConsensusCost::L1Distance, vec![0])),
-            is_consensus1: vec![true, false],
+            assignments: vec![SequenceAssignment::Consensus1, SequenceAssignment::Consensus2],
             // these are not checked
             scores1: vec![],
             scores2: vec![]
@@ -1873,7 +1972,14 @@ mod tests {
         assert_eq!(consensus, vec![DualConsensus {
             consensus1: Consensus::new(con1.to_vec(), ConsensusCost::L1Distance, vec![0, 1, 0]),
             consensus2: Some(Consensus::new(con2.to_vec(), ConsensusCost::L1Distance, vec![0, 0, 1])),
-            is_consensus1: vec![true, true, true, false, false, false],
+            assignments: vec![
+                SequenceAssignment::Consensus1,
+                SequenceAssignment::Consensus1,
+                SequenceAssignment::Consensus1,
+                SequenceAssignment::Consensus2,
+                SequenceAssignment::Consensus2,
+                SequenceAssignment::Consensus2,
+            ],
             // these are not checked
             scores1: vec![],
             scores2: vec![]
@@ -1915,7 +2021,14 @@ mod tests {
         assert_eq!(consensus, vec![DualConsensus {
             consensus1: Consensus::new(con1.to_vec(), ConsensusCost::L1Distance, vec![0, 0, 1]),
             consensus2: Some(Consensus::new(con2.to_vec(), ConsensusCost::L1Distance, vec![0, 0, 1])),
-            is_consensus1: vec![true, true, true, false, false, false],
+            assignments: vec![
+                SequenceAssignment::Consensus1,
+                SequenceAssignment::Consensus1,
+                SequenceAssignment::Consensus1,
+                SequenceAssignment::Consensus2,
+                SequenceAssignment::Consensus2,
+                SequenceAssignment::Consensus2,
+            ],
             // these are not checked
             scores1: vec![],
             scores2: vec![]
@@ -1956,10 +2069,19 @@ mod tests {
         for dc in consensus.iter() {
             // make sure it's dual
             assert!(dc.consensus2.is_some());
-            // make sure the edits are 2
-            assert_eq!(2, dc.consensus1.scores().iter().sum::<usize>()+dc.consensus2.as_ref().unwrap().scores().iter().sum::<usize>());
-            
-            // future: if we need to test the exact result, we're going to have to add it by hand later
+            // allele score lists omit equal-score reads, so add those distances once
+            let assigned = dc.consensus1.scores().iter().sum::<usize>()
+                + dc.consensus2.as_ref().unwrap().scores().iter().sum::<usize>();
+            let tied = dc.assignments.iter().zip(dc.scores1.iter()).zip(dc.scores2.iter())
+                .filter(|((assignment, _), _)| **assignment == SequenceAssignment::EqualScore)
+                .map(|((_, score1), score2)| {
+                    let score1 = score1.expect("equal-score read is tracked on allele 1");
+                    let score2 = score2.expect("equal-score read is tracked on allele 2");
+                    assert_eq!(score1, score2);
+                    score1
+                })
+                .sum::<usize>();
+            assert_eq!(2, assigned + tied);
         }
     }
 
@@ -1994,7 +2116,7 @@ mod tests {
         assert_eq!(consensus, vec![DualConsensus {
             consensus1: Consensus::new(con1.to_vec(), ConsensusCost::L1Distance, vec![0, 1]),
             consensus2: None,
-            is_consensus1: vec![true, true],
+            assignments: vec![SequenceAssignment::Consensus1, SequenceAssignment::Consensus1],
             // these are not checked
             scores1: vec![],
             scores2: vec![]
@@ -2002,7 +2124,7 @@ mod tests {
         DualConsensus {
             consensus1: Consensus::new(con2.to_vec(), ConsensusCost::L1Distance, vec![1, 0]),
             consensus2: None,
-            is_consensus1: vec![true, true],
+            assignments: vec![SequenceAssignment::Consensus1, SequenceAssignment::Consensus1],
             // these are not checked
             scores1: vec![],
             scores2: vec![]
@@ -2034,7 +2156,18 @@ mod tests {
                     ConsensusCost::L1Distance,
                     vec![3, 0, 0, 0, 0, 0] // shift it here, with a worse ED
                 )), 
-                is_consensus1: vec![true, true, false, true, true, false, false, false, false, false], // mark third from true -> false
+                assignments: vec![
+                    SequenceAssignment::Consensus1,
+                    SequenceAssignment::Consensus1,
+                    SequenceAssignment::Consensus2, // mark third from consensus 1 to consensus 2
+                    SequenceAssignment::Consensus1,
+                    SequenceAssignment::Consensus1,
+                    SequenceAssignment::Consensus2,
+                    SequenceAssignment::Consensus2,
+                    SequenceAssignment::Consensus2,
+                    SequenceAssignment::Consensus2,
+                    SequenceAssignment::Consensus2,
+                ],
                 // these are not checked
                 scores1: vec![],
                 scores2: vec![]

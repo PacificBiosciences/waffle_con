@@ -29,8 +29,8 @@ for s in sequences.iter() {
 // run consensus and check the results
 let consensuses = cdwfa.consensus().unwrap();
 assert_eq!(consensuses.len(), 1);
-assert_eq!(consensuses[0].consensus1(), &Consensus::new(sequences[1].clone(), ConsensusCost::L1Distance, vec![1, 0, 0, 1]));
-assert_eq!(consensuses[0].consensus2().unwrap(), &Consensus::new(sequences[6].clone(), ConsensusCost::L1Distance, vec![1, 1, 0, 0]));
+assert_eq!(consensuses[0].consensus1(), &Consensus::new(sequences[1].clone(), ConsensusCost::L1Distance, vec![1, 0, 0, 1], None).unwrap());
+assert_eq!(consensuses[0].consensus2().unwrap(), &Consensus::new(sequences[6].clone(), ConsensusCost::L1Distance, vec![1, 1, 0, 0], None).unwrap());
 assert_eq!(consensuses[0].assignments(), &[
     SequenceAssignment::Consensus1,
     SequenceAssignment::Consensus1,
@@ -137,7 +137,7 @@ impl DualConsensus {
     /// # Arguments
     /// * `finalized_node` - the node that we are converting to a consensus
     /// * `consensus_cost` - the cost model that gets propated
-    fn from_node(finalized_node: &DualConsensusNode, consensus_cost: ConsensusCost) -> DualConsensus {
+    fn from_node(finalized_node: &DualConsensusNode, consensus_cost: ConsensusCost) -> Result<DualConsensus, SimpleError> {
         // check if we need to swap the order
         let swap_order = finalized_node.is_dual && (finalized_node.consensus2 < finalized_node.consensus1);
 
@@ -158,8 +158,8 @@ impl DualConsensus {
         }
 
         // now we can store the consensus sequences as well as the corresponding indices in the final output
-        let c1 = Consensus::new(finalized_node.consensus1.clone(), consensus_cost, consensus_scores[0].clone());
-        let c2 = Consensus::new(finalized_node.consensus2.clone(), consensus_cost, consensus_scores[1].clone());
+        let c1 = Consensus::new(finalized_node.consensus1.clone(), consensus_cost, consensus_scores[0].clone(), None)?;
+        let c2 = Consensus::new(finalized_node.consensus2.clone(), consensus_cost, consensus_scores[1].clone(), None)?;
 
         // reformat the actual consensus assignments based on swappage, and build result
         let (consensus1, consensus2) = if swap_order {
@@ -176,13 +176,13 @@ impl DualConsensus {
             (full1, full2)
         };
 
-        DualConsensus {
+        Ok(DualConsensus {
             consensus1,
             consensus2,
             assignments,
             scores1,
             scores2
-        }
+        })
     }
 
     // Returns true if this is a dual consensus result
@@ -512,7 +512,7 @@ impl<'a> DualConsensusDWFA<'a> {
                         let dual_con_result = DualConsensus::from_node(
                             &finalized_node,
                             self.config.consensus_cost
-                        );
+                        )?;
                         trace!("\tadding to ret");//: {dual_con_result:?}");
                         trace!("\tcon1: {}", std::str::from_utf8(dual_con_result.consensus1().sequence())?);
                         if let Some(c2) = dual_con_result.consensus2() {
@@ -813,7 +813,7 @@ impl<'a> DualConsensusDWFA<'a> {
             // TODO: how do we want to handle this long-term? this returns an empty string consensus
             let no_offsets = vec![None; self.sequences.len()]; // we need these to get costs of 0
             let root_node = DualConsensusNode::new_root_node(&self.sequences, &no_offsets, &self.config)?;
-            ret.push(DualConsensus::from_node(&root_node, self.consensus_cost()));
+            ret.push(DualConsensus::from_node(&root_node, self.consensus_cost())?);
         }
 
         debug!("nodes_explored: {nodes_explored}");
@@ -1223,8 +1223,21 @@ impl DualConsensusNode {
 
         // first, match on the existence of the DWFAs
         match (self.dwfas1[seq_index].as_ref(), self.dwfas2[seq_index].as_ref()) {
-            (Some(_), None) => SequenceAssignment::Consensus1,
-            (None, Some(_)) => SequenceAssignment::Consensus2,
+            // if one one is tracked, we still need to check if that one hit the ED limit
+            (Some(first), None) => {
+                if exceeded(first) {
+                    SequenceAssignment::EditDistanceLimit
+                } else {
+                    SequenceAssignment::Consensus1
+                }
+            },
+            (None, Some(second)) => {
+                if exceeded(second) {
+                    SequenceAssignment::EditDistanceLimit
+                } else {
+                    SequenceAssignment::Consensus2
+                }
+            },
             // both exist, so now match on if either or both are exceeded
             (Some(first), Some(second)) => match (exceeded(first), exceeded(second)) {
                 (true, true) => SequenceAssignment::EditDistanceLimit,
@@ -1614,8 +1627,8 @@ mod tests {
         // make sure that either we do not have consensus 2 OR consensus 1 comes before consensus 2
         assert!(con2.is_none() || con1.as_ref().unwrap() < con2.as_ref().unwrap());
 
-        let consensus1 = Consensus::new(con1.unwrap(), cost_mode, ed1);
-        let consensus2 = con2.map(|c2| Consensus::new(c2, cost_mode, ed2));
+        let consensus1 = Consensus::new(con1.unwrap(), cost_mode, ed1, None).unwrap();
+        let consensus2 = con2.map(|c2| Consensus::new(c2, cost_mode, ed2, None).unwrap());
         let consensus = DualConsensus {
             consensus1,
             consensus2,
@@ -1671,8 +1684,9 @@ mod tests {
             consensus1: Consensus::new(
                 sequence.to_vec(),
                 ConsensusCost::L1Distance,
-                vec![0]
-            ),
+                vec![0],
+                None,
+            ).unwrap(),
             consensus2: None,
             assignments: vec![SequenceAssignment::Consensus1],
             // these are not checked
@@ -1703,8 +1717,9 @@ mod tests {
             consensus1: Consensus::new(
                 sequence.to_vec(),
                 ConsensusCost::L1Distance,
-                vec![0, 0, 1]
-            ),
+                vec![0, 0, 1],
+                None,
+            ).unwrap(),
             consensus2: None,
             assignments: vec![SequenceAssignment::Consensus1; 3],
             // these are not checked
@@ -1739,7 +1754,7 @@ mod tests {
         let consensus = consensus_dwfa.consensus().unwrap();
         // assert_eq!(consensus.len(), 1);
         assert_eq!(consensus, vec![DualConsensus {
-            consensus1: Consensus::new(expected_consensus.to_vec(), ConsensusCost::L1Distance, vec![2, 2, 1]),
+            consensus1: Consensus::new(expected_consensus.to_vec(), ConsensusCost::L1Distance, vec![2, 2, 1], None).unwrap(),
             consensus2: None,
             assignments: vec![SequenceAssignment::Consensus1; 3],
             // these are not checked
@@ -1777,7 +1792,7 @@ mod tests {
         let consensus = consensus_dwfa.consensus().unwrap();
         // assert_eq!(consensus.len(), 1);
         assert_eq!(consensus, vec![DualConsensus {
-            consensus1: Consensus::new(expected_consensus.to_vec(), ConsensusCost::L1Distance, vec![1, 1, 0]),
+            consensus1: Consensus::new(expected_consensus.to_vec(), ConsensusCost::L1Distance, vec![1, 1, 0], None).unwrap(),
             consensus2: None,
             assignments: vec![SequenceAssignment::Consensus1; 3],
             // these are not checked
@@ -1816,7 +1831,7 @@ mod tests {
         let consensus = consensus_dwfa.consensus().unwrap();
         // assert_eq!(consensus.len(), 1);
         assert_eq!(consensus, vec![DualConsensus {
-            consensus1: Consensus::new(actual_consensus.to_vec(), ConsensusCost::L1Distance, vec![1, 0, 1]),
+            consensus1: Consensus::new(actual_consensus.to_vec(), ConsensusCost::L1Distance, vec![1, 0, 1], None).unwrap(),
             consensus2: None,
             assignments: vec![SequenceAssignment::Consensus1; 3],
             // these are not checked
@@ -1843,8 +1858,8 @@ mod tests {
         // now check that the consensus is the same as our sequence
         let consensus = consensus_dwfa.consensus().unwrap();
         assert_eq!(consensus, vec![DualConsensus {
-            consensus1: Consensus::new(sequence.to_vec(), ConsensusCost::L1Distance, vec![0]),
-            consensus2: Some(Consensus::new(alt_sequence.to_vec(), ConsensusCost::L1Distance, vec![0])),
+            consensus1: Consensus::new(sequence.to_vec(), ConsensusCost::L1Distance, vec![0], None).unwrap(),
+            consensus2: Some(Consensus::new(alt_sequence.to_vec(), ConsensusCost::L1Distance, vec![0], None).unwrap()),
             assignments: vec![SequenceAssignment::Consensus1, SequenceAssignment::Consensus2],
             // these are not checked
             scores1: vec![],
@@ -1885,6 +1900,38 @@ mod tests {
         assert_eq!(consensus[0].consensus2().unwrap().scores(), &[0, 0]);
     }
 
+    /// Tests the case where we have one solid consensus and one outlier read
+    #[test]
+    fn test_edit_distance_limit_without_split() {
+        let good = b"ACGTACGTACGT";
+        let bad = b"TTTTTTTTTTTT";
+        let mut consensus_dwfa = DualConsensusDWFA::with_config(
+            CdwfaConfigBuilder::default()
+                .max_edit_distance(Some(3))
+                .build().unwrap()
+        ).unwrap();
+        for _ in 0..5 {
+            consensus_dwfa.add_sequence(good).unwrap();
+        }
+        consensus_dwfa.add_sequence(bad).unwrap();
+
+        let consensus = consensus_dwfa.consensus().unwrap();
+        assert_eq!(consensus.len(), 1);
+        assert!(consensus[0].consensus2().is_none());
+        assert_eq!(consensus[0].consensus1().sequence(), good);
+        assert_eq!(consensus[0].assignments(), &[
+            SequenceAssignment::Consensus1,
+            SequenceAssignment::Consensus1,
+            SequenceAssignment::Consensus1,
+            SequenceAssignment::Consensus1,
+            SequenceAssignment::Consensus1,
+            SequenceAssignment::EditDistanceLimit,
+        ]);
+        assert_eq!(consensus[0].consensus1().scores(), &[0, 0, 0, 0, 0]);
+        assert_eq!(consensus[0].consensus1().assignments(), None);
+        assert_eq!(consensus[0].scores1()[5], Some(3));
+    }
+
     #[test]
     fn test_dual_unequal_001() {
         let sequence     = b"ACGT";
@@ -1903,8 +1950,8 @@ mod tests {
         // now check that the consensus is the same as our sequence
         let consensus = consensus_dwfa.consensus().unwrap();
         assert_eq!(consensus, vec![DualConsensus {
-            consensus1: Consensus::new(sequence.to_vec(), ConsensusCost::L1Distance, vec![0]),
-            consensus2: Some(Consensus::new(alt_sequence.to_vec(), ConsensusCost::L1Distance, vec![0])),
+            consensus1: Consensus::new(sequence.to_vec(), ConsensusCost::L1Distance, vec![0], None).unwrap(),
+            consensus2: Some(Consensus::new(alt_sequence.to_vec(), ConsensusCost::L1Distance, vec![0], None).unwrap()),
             assignments: vec![SequenceAssignment::Consensus1, SequenceAssignment::Consensus2],
             // these are not checked
             scores1: vec![],
@@ -1930,8 +1977,8 @@ mod tests {
         // now check that the consensus is the same as our sequence
         let consensus = consensus_dwfa.consensus().unwrap();
         assert_eq!(consensus, vec![DualConsensus {
-            consensus1: Consensus::new(sequence.to_vec(), ConsensusCost::L1Distance, vec![0]),
-            consensus2: Some(Consensus::new(alt_sequence.to_vec(), ConsensusCost::L1Distance, vec![0])),
+            consensus1: Consensus::new(sequence.to_vec(), ConsensusCost::L1Distance, vec![0], None).unwrap(),
+            consensus2: Some(Consensus::new(alt_sequence.to_vec(), ConsensusCost::L1Distance, vec![0], None).unwrap()),
             assignments: vec![SequenceAssignment::Consensus1, SequenceAssignment::Consensus2],
             // these are not checked
             scores1: vec![],
@@ -1970,8 +2017,8 @@ mod tests {
         // now check that the consensus is the same as our sequence
         let consensus = consensus_dwfa.consensus().unwrap();
         assert_eq!(consensus, vec![DualConsensus {
-            consensus1: Consensus::new(con1.to_vec(), ConsensusCost::L1Distance, vec![0, 1, 0]),
-            consensus2: Some(Consensus::new(con2.to_vec(), ConsensusCost::L1Distance, vec![0, 0, 1])),
+            consensus1: Consensus::new(con1.to_vec(), ConsensusCost::L1Distance, vec![0, 1, 0], None).unwrap(),
+            consensus2: Some(Consensus::new(con2.to_vec(), ConsensusCost::L1Distance, vec![0, 0, 1], None).unwrap()),
             assignments: vec![
                 SequenceAssignment::Consensus1,
                 SequenceAssignment::Consensus1,
@@ -2019,8 +2066,8 @@ mod tests {
         // now check that the consensus is the same as our sequence
         let consensus = consensus_dwfa.consensus().unwrap();
         assert_eq!(consensus, vec![DualConsensus {
-            consensus1: Consensus::new(con1.to_vec(), ConsensusCost::L1Distance, vec![0, 0, 1]),
-            consensus2: Some(Consensus::new(con2.to_vec(), ConsensusCost::L1Distance, vec![0, 0, 1])),
+            consensus1: Consensus::new(con1.to_vec(), ConsensusCost::L1Distance, vec![0, 0, 1], None).unwrap(),
+            consensus2: Some(Consensus::new(con2.to_vec(), ConsensusCost::L1Distance, vec![0, 0, 1], None).unwrap()),
             assignments: vec![
                 SequenceAssignment::Consensus1,
                 SequenceAssignment::Consensus1,
@@ -2114,7 +2161,7 @@ mod tests {
         // now check that the consensus is the same as our sequence
         let consensus = consensus_dwfa.consensus().unwrap();
         assert_eq!(consensus, vec![DualConsensus {
-            consensus1: Consensus::new(con1.to_vec(), ConsensusCost::L1Distance, vec![0, 1]),
+            consensus1: Consensus::new(con1.to_vec(), ConsensusCost::L1Distance, vec![0, 1], None).unwrap(),
             consensus2: None,
             assignments: vec![SequenceAssignment::Consensus1, SequenceAssignment::Consensus1],
             // these are not checked
@@ -2122,7 +2169,7 @@ mod tests {
             scores2: vec![]
         }, 
         DualConsensus {
-            consensus1: Consensus::new(con2.to_vec(), ConsensusCost::L1Distance, vec![1, 0]),
+            consensus1: Consensus::new(con2.to_vec(), ConsensusCost::L1Distance, vec![1, 0], None).unwrap(),
             consensus2: None,
             assignments: vec![SequenceAssignment::Consensus1, SequenceAssignment::Consensus1],
             // these are not checked
@@ -2149,13 +2196,15 @@ mod tests {
                 consensus1: Consensus::new(
                     expected_consensus.consensus1.sequence().to_vec(), 
                     ConsensusCost::L1Distance, 
-                    vec![0, 4, 4, 2] // delete the third entry here
-                ),
+                    vec![0, 4, 4, 2], // delete the third entry here
+                    None,
+                ).unwrap(),
                 consensus2: Some(Consensus::new(
                     expected_consensus.consensus2.as_ref().unwrap().sequence().to_vec(), 
                     ConsensusCost::L1Distance,
-                    vec![3, 0, 0, 0, 0, 0] // shift it here, with a worse ED
-                )), 
+                    vec![3, 0, 0, 0, 0, 0], // shift it here, with a worse ED
+                    None,
+                ).unwrap()), 
                 assignments: vec![
                     SequenceAssignment::Consensus1,
                     SequenceAssignment::Consensus1,

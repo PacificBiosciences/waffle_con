@@ -33,16 +33,16 @@ let consensuses = cdwfa.consensus().unwrap();
 assert_eq!(consensuses.consensuses(), &[
     // these are in alphabetically ordered by the chains; in the example these chains are pairs (i.e. length 2)
     vec![
-        Consensus::new(b"ACGT".to_vec(), ConsensusCost::L1Distance, vec![0; 3]),
-        Consensus::new(b"ACCCGGTT".to_vec(), ConsensusCost::L1Distance, vec![0; 3])
+        Consensus::new(b"ACGT".to_vec(), ConsensusCost::L1Distance, vec![0; 3], None).unwrap(),
+        Consensus::new(b"ACCCGGTT".to_vec(), ConsensusCost::L1Distance, vec![0; 3], None).unwrap()
     ],
     vec![
-        Consensus::new(b"TCCGT".to_vec(), ConsensusCost::L1Distance, vec![0; 6]), // this is shared between consensus 1 and 2, so it has costs for both
-        Consensus::new(b"ACGGT".to_vec(), ConsensusCost::L1Distance, vec![0; 3])
+        Consensus::new(b"TCCGT".to_vec(), ConsensusCost::L1Distance, vec![0; 6], None).unwrap(), // this is shared between consensus 1 and 2, so it has costs for both
+        Consensus::new(b"ACGGT".to_vec(), ConsensusCost::L1Distance, vec![0; 3], None).unwrap()
     ],
     vec![
-        Consensus::new(b"TCCGT".to_vec(), ConsensusCost::L1Distance, vec![0; 6]), // this is shared between consensus 1 and 2, so it has costs for both
-        Consensus::new(b"TCCGT".to_vec(), ConsensusCost::L1Distance, vec![0; 3])
+        Consensus::new(b"TCCGT".to_vec(), ConsensusCost::L1Distance, vec![0; 6], None).unwrap(), // this is shared between consensus 1 and 2, so it has costs for both
+        Consensus::new(b"TCCGT".to_vec(), ConsensusCost::L1Distance, vec![0; 3], None).unwrap()
     ]
 ]);
 assert_eq!(consensuses.sequence_indices(), &[
@@ -475,7 +475,7 @@ mod tests {
         let con_vec = consensuses.into_iter()
             .map(|con_chain| {
                 con_chain.into_iter().map(|con| {
-                    Consensus::new(con, cost_mode, vec![])
+                    Consensus::new(con, cost_mode, vec![], None).unwrap()
                 })
                 .collect()
             })
@@ -589,8 +589,9 @@ mod tests {
                 vec![Consensus::new(
                     sequence.to_vec(),
                     ConsensusCost::L1Distance,
-                    vec![0]
-                ); 2]
+                    vec![0],
+                    None,
+                ).unwrap(); 2]
             ],
             sequence_indices: vec![0]
         });
@@ -622,16 +623,16 @@ mod tests {
         assert_eq!(consensuses.consensuses(), &[
             // these are in alphabetically order by the consensus content
             vec![
-                Consensus::new(b"ACGT".to_vec(), ConsensusCost::L1Distance, vec![0; 3]),
-                Consensus::new(b"ACCCGGTT".to_vec(), ConsensusCost::L1Distance, vec![0; 3])
+                Consensus::new(b"ACGT".to_vec(), ConsensusCost::L1Distance, vec![0; 3], None).unwrap(),
+                Consensus::new(b"ACCCGGTT".to_vec(), ConsensusCost::L1Distance, vec![0; 3], None).unwrap()
             ],
             vec![
-                Consensus::new(b"TCCGT".to_vec(), ConsensusCost::L1Distance, vec![0; 6]),
-                Consensus::new(b"ACGGT".to_vec(), ConsensusCost::L1Distance, vec![0; 3])
+                Consensus::new(b"TCCGT".to_vec(), ConsensusCost::L1Distance, vec![0; 6], None).unwrap(),
+                Consensus::new(b"ACGGT".to_vec(), ConsensusCost::L1Distance, vec![0; 3], None).unwrap()
             ],
             vec![
-                Consensus::new(b"TCCGT".to_vec(), ConsensusCost::L1Distance, vec![0; 6]),
-                Consensus::new(b"TCCGT".to_vec(), ConsensusCost::L1Distance, vec![0; 3])
+                Consensus::new(b"TCCGT".to_vec(), ConsensusCost::L1Distance, vec![0; 6], None).unwrap(),
+                Consensus::new(b"TCCGT".to_vec(), ConsensusCost::L1Distance, vec![0; 3], None).unwrap()
             ]
         ]);
         assert_eq!(consensuses.sequence_indices(), &[

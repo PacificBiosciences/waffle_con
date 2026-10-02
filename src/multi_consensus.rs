@@ -73,9 +73,9 @@ mod tests {
     #[test]
     fn test_multiconsensus_sort() {
         let consensuses = vec![
-            Consensus::new(b"ACGT".to_vec(), ConsensusCost::L1Distance, vec![0]),
-            Consensus::new(b"TGCA".to_vec(), ConsensusCost::L1Distance, vec![0]),
-            Consensus::new(b"AAAA".to_vec(), ConsensusCost::L1Distance, vec![0]),
+            Consensus::new(b"ACGT".to_vec(), ConsensusCost::L1Distance, vec![0], None).unwrap(),
+            Consensus::new(b"TGCA".to_vec(), ConsensusCost::L1Distance, vec![0], None).unwrap(),
+            Consensus::new(b"AAAA".to_vec(), ConsensusCost::L1Distance, vec![0], None).unwrap(),
         ];
         let sequence_indices = vec![
             2, 0, 1
@@ -85,9 +85,9 @@ mod tests {
         // these should now be sorted by sequence with the sequence_indices adjusted to match the new order
         assert_eq!(multicon, MultiConsensus {
             consensuses: vec![
-                Consensus::new(b"AAAA".to_vec(), ConsensusCost::L1Distance, vec![0]),
-                Consensus::new(b"ACGT".to_vec(), ConsensusCost::L1Distance, vec![0]),
-                Consensus::new(b"TGCA".to_vec(), ConsensusCost::L1Distance, vec![0]),
+                Consensus::new(b"AAAA".to_vec(), ConsensusCost::L1Distance, vec![0], None).unwrap(),
+                Consensus::new(b"ACGT".to_vec(), ConsensusCost::L1Distance, vec![0], None).unwrap(),
+                Consensus::new(b"TGCA".to_vec(), ConsensusCost::L1Distance, vec![0], None).unwrap(),
             ], 
             sequence_indices: vec![0, 1, 2]
         });

@@ -23,12 +23,13 @@ let consensuses = cdwfa.consensus().unwrap();
 assert_eq!(consensuses.len(), 1);
 assert_eq!(consensuses[0].sequence(), sequences[1]);
 assert_eq!(consensuses[0].scores(), &[1, 0, 1]);
+assert_eq!(consensuses[0].assignments(), None);
 ```
 */
 
 use log::{debug, trace};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use simple_error::bail;
+use simple_error::{bail, SimpleError};
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 
@@ -39,6 +40,15 @@ use crate::pqueue_tracker::PQueueTracker;
 /// Lower cost, then longer consensus, then an earlier tie-breaker.
 type NodePriority = (Reverse<usize>, usize, Reverse<u64>);
 
+/// Whether a read in a single consensus was used or halted at the edit-distance cap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConsensusAssignment {
+    /// The read was tracked through the consensus.
+    Included,
+    /// The read stopped contributing because it reached the edit-distance cap.
+    EditDistanceLimit,
+}
+
 /// Contains a final consensus result
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Consensus {
@@ -47,17 +57,33 @@ pub struct Consensus {
     /// The consensus scoring model
     consensus_cost: ConsensusCost,
     /// Vector of the scores from the consensus to each sequence
-    scores: Vec<usize>
+    scores: Vec<usize>,
+    /// Per-read assignment. `None` when every score belongs to an included read.
+    /// `Some` when any read was halted at the edit-distance cap; the vector matches `scores`.
+    assignments: Option<Vec<ConsensusAssignment>>,
 }
 
 impl Consensus {
     /// Constructor
-    pub fn new(sequence: Vec<u8>, consensus_cost: ConsensusCost, scores: Vec<usize>) -> Consensus {
-        Consensus {
+    /// # Errors
+    /// * if `assignments` is `Some` and its length does not match `scores`
+    pub fn new(
+        sequence: Vec<u8>,
+        consensus_cost: ConsensusCost,
+        scores: Vec<usize>,
+        assignments: Option<Vec<ConsensusAssignment>>,
+    ) -> Result<Consensus, SimpleError> {
+        if let Some(assignments) = &assignments {
+            if assignments.len() != scores.len() {
+                bail!("assignments and scores must have the same length");
+            }
+        }
+        Ok(Consensus {
             sequence,
             consensus_cost,
-            scores
-        }
+            scores,
+            assignments,
+        })
     }
 
     // Getters
@@ -71,6 +97,11 @@ impl Consensus {
 
     pub fn scores(&self) -> &[usize] {
         &self.scores
+    }
+
+    /// Per-read assignment. `None` when every score belongs to an included read.
+    pub fn assignments(&self) -> Option<&[ConsensusAssignment]> {
+        self.assignments.as_deref()
     }
 }
 
@@ -276,8 +307,9 @@ impl<'a> ConsensusDWFA<'a> {
                     ret.push(Consensus::new(
                         finalized_node.consensus().to_vec(),
                         self.config.consensus_cost,
-                        finalized_node.costs(self.config.consensus_cost)
-                    ));
+                        finalized_node.costs(self.config.consensus_cost),
+                        finalized_node.assignments(),
+                    )?);
                 }
             }
 
@@ -540,6 +572,28 @@ impl ConsensusNode {
             .collect()
     }
 
+    /// Labels each read. `None` when every read was used.
+    /// `Some` when any read was not Included.
+    fn assignments(&self) -> Option<Vec<ConsensusAssignment>> {
+        let labels: Vec<ConsensusAssignment> = self.dwfas.iter()
+            .map(|opt_dwfa| {
+                if opt_dwfa.as_ref().is_some_and(|dwfa| dwfa.state() == DWFALiteState::ExceededEditDistanceLimit) {
+                    ConsensusAssignment::EditDistanceLimit
+                } else {
+                    ConsensusAssignment::Included
+                }
+            })
+            .collect();
+
+        // if ALL labels are included, then we can safely send back None
+        if labels.iter().all(|label| *label == ConsensusAssignment::Included) {
+            None
+        } else {
+            // otherwise, we need to send back the labels
+            Some(labels)
+        }
+    }
+
     /// Returns the total score for the node
     fn total_cost(&self, consensus_cost: ConsensusCost) -> usize {
         self.costs(consensus_cost).iter().sum()
@@ -666,7 +720,8 @@ mod tests {
         assert_eq!(consensus, vec![Consensus {
             sequence: sequence.to_vec(),
             consensus_cost: ConsensusCost::L1Distance,
-            scores: vec![0]
+            scores: vec![0],
+            assignments: None,
         }]);
     }
 
@@ -689,12 +744,14 @@ mod tests {
             Consensus {
                 sequence: sequence2.to_vec(),
                 consensus_cost: ConsensusCost::L1Distance,
-                scores: vec![1, 0]
+                scores: vec![1, 0],
+                assignments: None,
             },
             Consensus {
                 sequence: sequence.to_vec(),
                 consensus_cost: ConsensusCost::L1Distance,
-                scores: vec![0, 1]
+                scores: vec![0, 1],
+                assignments: None,
             },
         ]);
     }
@@ -721,7 +778,8 @@ mod tests {
             Consensus {
                 sequence: sequence.to_vec(),
                 consensus_cost: ConsensusCost::L1Distance,
-                scores: vec![0, 0, 1]
+                scores: vec![0, 0, 1],
+                assignments: None,
             }
         ]);
     }
@@ -835,8 +893,8 @@ mod tests {
         // this first approach generated multiple possible ones that are in the middle
         let consensus = consensus_dwfa.consensus().unwrap();
         assert_eq!(consensus, [
-            Consensus { sequence: vec![65, 67], consensus_cost: ConsensusCost::L1Distance, scores: vec![1, 0, 1, 2] }, 
-            Consensus { sequence: vec![65, 67, 71], consensus_cost: ConsensusCost::L1Distance, scores: vec![2, 1, 0, 1] }
+            Consensus { sequence: vec![65, 67], consensus_cost: ConsensusCost::L1Distance, scores: vec![1, 0, 1, 2], assignments: None },
+            Consensus { sequence: vec![65, 67, 71], consensus_cost: ConsensusCost::L1Distance, scores: vec![2, 1, 0, 1], assignments: None }
         ]);
 
         // second, verify that allowing early termination fixes it to the original result
@@ -852,7 +910,7 @@ mod tests {
         // this first approach generated multiple possible ones that are in the middle
         let consensus = consensus_dwfa.consensus().unwrap();
         assert_eq!(consensus, [
-            Consensus { sequence: expected_consensus.to_vec(), consensus_cost: ConsensusCost::L1Distance, scores: vec![0; 4] },
+            Consensus { sequence: expected_consensus.to_vec(), consensus_cost: ConsensusCost::L1Distance, scores: vec![0; 4], assignments: None },
         ]);
     }
 
@@ -945,5 +1003,11 @@ mod tests {
         assert_eq!(consensus.len(), 1);
         assert_eq!(consensus[0].sequence(), good);
         assert_eq!(consensus[0].scores(), &[0, 0, 0, 3]);
+        assert_eq!(consensus[0].assignments(), Some(&[
+            ConsensusAssignment::Included,
+            ConsensusAssignment::Included,
+            ConsensusAssignment::Included,
+            ConsensusAssignment::EditDistanceLimit,
+        ][..]));
     }
 }

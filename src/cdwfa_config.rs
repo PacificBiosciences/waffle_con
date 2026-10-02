@@ -75,6 +75,10 @@ pub struct CdwfaConfig {
     /// Optional edit-distance cap as a fraction of the baseline read length. `None` disables the fractional cap.
     /// When both caps are set, the tighter one is used.
     pub max_edit_distance_fraction: Option<f64>,
+    /// Optional floor for the resolved edit-distance cap. `None` leaves the derived cap unchanged.
+    /// Applied after the hard maximum and fractional cap are combined, and it can raise the result above either one.
+    /// It does not create a cap when neither maximum is set.
+    pub min_edit_distance: Option<usize>,
 }
 
 impl Default for CdwfaConfig {
@@ -110,14 +114,16 @@ impl Default for CdwfaConfig {
             // by default, do not cap how far a read may diverge
             max_edit_distance: None,
             max_edit_distance_fraction: None,
+            min_edit_distance: None,
         }
     }
 }
 
 impl CdwfaConfig {
     /// Edit-distance cap for a baseline of `baseline_len` bases.
-    /// Uses the tighter of [`Self::max_edit_distance`] and `floor(max_edit_distance_fraction * baseline_len)`.
-    /// Returns `None` when neither limit is set.
+    /// Uses the tighter of [`Self::max_edit_distance`] and `floor(max_edit_distance_fraction * baseline_len)`,
+    /// then raises that result to [`Self::min_edit_distance`] when the floor is higher.
+    /// Returns `None` when neither maximum is set.
     /// # Errors
     /// * if `max_edit_distance_fraction` is negative or non-finite
     pub fn max_edit_distance_for(&self, baseline_len: usize) -> Result<Option<usize>, Box<dyn std::error::Error>> {
@@ -131,12 +137,20 @@ impl CdwfaConfig {
             None
         };
 
-        // then, resolve the final max ED
-        Ok(match (self.max_edit_distance, dynamic_max) {
+        // combine the maxes to get the tighter of the two
+        let derived = match (self.max_edit_distance, dynamic_max) {
             // if both are set, use the tighter of the two
             (Some(hard_max), Some(dynamic_max)) => Some(hard_max.min(dynamic_max)),
             // otherwise, use any that are set
             (hard_max, dynamic_max) => hard_max.or(dynamic_max),
+        };
+
+        // then apply the floor if it's set
+        Ok(match (derived, self.min_edit_distance) {
+            // we have a cap and a floor, so use the max of the two
+            (Some(cap), Some(floor)) => Some(cap.max(floor)),
+            // one or both are unset, so just return the cap Option
+            (cap, _) => cap,
         })
     }
 

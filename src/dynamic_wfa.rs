@@ -363,10 +363,16 @@ mod tests {
     }
 
     /// Resolves a consensus cap and stores that absolute maximum on a new DWFA.
-    fn dwfa_with_consensus_cap(baseline_len: usize, hard_max: Option<usize>, fraction: Option<f64>) -> Result<DWFALite, Box<dyn std::error::Error>> {
+    fn dwfa_with_consensus_cap(
+        baseline_len: usize,
+        hard_max: Option<usize>,
+        fraction: Option<f64>,
+        floor: Option<usize>,
+    ) -> Result<DWFALite, Box<dyn std::error::Error>> {
         let max_edit_distance = CdwfaConfig {
             max_edit_distance: hard_max,
             max_edit_distance_fraction: fraction,
+            min_edit_distance: floor,
             ..Default::default()
         }.max_edit_distance_for(baseline_len)?;
         Ok(DWFALite::new(dwfa_config(None, false, max_edit_distance)))
@@ -588,7 +594,7 @@ mod tests {
     #[test]
     fn test_exact_match_under_edit_distance_cap() {
         let sequence = b"ACGTACGT";
-        let mut dwfa = dwfa_with_consensus_cap(sequence.len(), Some(2), None).unwrap();
+        let mut dwfa = dwfa_with_consensus_cap(sequence.len(), Some(2), None, None).unwrap();
         let other = &sequence[..4];
         assert_eq!(dwfa.update(sequence, other).unwrap(), 0);
         assert_eq!(dwfa.get_extension_candidates(sequence, other).get(&b'A'), Some(&1));
@@ -599,7 +605,7 @@ mod tests {
     fn test_hard_edit_distance_cap() {
         let baseline = b"ACGTACGTACGT";
         let other = b"TTTTTTTTTTTT";
-        let mut dwfa = dwfa_with_consensus_cap(baseline.len(), Some(3), None).unwrap();
+        let mut dwfa = dwfa_with_consensus_cap(baseline.len(), Some(3), None, None).unwrap();
         assert_eq!(dwfa.update(baseline, other).unwrap(), 3);
         assert_eq!(dwfa.state(), DWFALiteState::ExceededEditDistanceLimit);
         assert!(dwfa.get_extension_candidates(baseline, other).is_empty());
@@ -617,7 +623,7 @@ mod tests {
         let baseline = vec![b'A'; 100];
         let mut other = vec![b'T'; 6];
         other.extend(std::iter::repeat(b'A').take(94));
-        let mut dwfa = dwfa_with_consensus_cap(baseline.len(), None, Some(0.05)).unwrap();
+        let mut dwfa = dwfa_with_consensus_cap(baseline.len(), None, Some(0.05), None).unwrap();
         assert_eq!(dwfa.max_edit_distance(), Some(5));
         assert_eq!(dwfa.update(&baseline, &other).unwrap(), 5);
         assert_eq!(dwfa.state(), DWFALiteState::ExceededEditDistanceLimit);
@@ -626,13 +632,26 @@ mod tests {
 
     #[test]
     fn test_edit_distance_cap_uses_tighter_limit() {
-        let tighter_hard = dwfa_with_consensus_cap(100, Some(3), Some(0.05)).unwrap();
+        let tighter_hard = dwfa_with_consensus_cap(100, Some(3), Some(0.05), None).unwrap();
         assert_eq!(tighter_hard.max_edit_distance(), Some(3));
-        let tighter_fraction = dwfa_with_consensus_cap(100, Some(10), Some(0.05)).unwrap();
+        let tighter_fraction = dwfa_with_consensus_cap(100, Some(10), Some(0.05), None).unwrap();
         assert_eq!(tighter_fraction.max_edit_distance(), Some(5));
-        let unlimited = dwfa_with_consensus_cap(100, None, None).unwrap();
+        let unlimited = dwfa_with_consensus_cap(100, None, None, None).unwrap();
         assert_eq!(unlimited.max_edit_distance(), None);
-        assert!(dwfa_with_consensus_cap(100, None, Some(-0.1)).is_err());
-        assert!(dwfa_with_consensus_cap(100, None, Some(f64::NAN)).is_err());
+        assert!(dwfa_with_consensus_cap(100, None, Some(-0.1), None).is_err());
+        assert!(dwfa_with_consensus_cap(100, None, Some(f64::NAN), None).is_err());
+    }
+
+    #[test]
+    fn test_edit_distance_floor_raises_derived_cap() {
+        // floor(0.05 * 19) == 0, so the floor is the resolved cap
+        let raised = dwfa_with_consensus_cap(19, None, Some(0.05), Some(2)).unwrap();
+        assert_eq!(raised.max_edit_distance(), Some(2));
+        // a derived cap already above the floor stays at the derived value
+        let unchanged = dwfa_with_consensus_cap(100, None, Some(0.05), Some(2)).unwrap();
+        assert_eq!(unchanged.max_edit_distance(), Some(5));
+        // a floor with no maximum does not create a cap
+        let unlimited = dwfa_with_consensus_cap(19, None, None, Some(2)).unwrap();
+        assert_eq!(unlimited.max_edit_distance(), None);
     }
 }

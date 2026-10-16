@@ -78,7 +78,21 @@ pub struct DWFALite {
     wavefront: Vec<usize>,
     // this is an offset into `other_seq` that the baseline starts
     offset: usize,
+    /// Cached maximum of `wavefront`. Values only grow within one edit distance.
+    max_wavefront: usize,
+    /// Cached farthest position reached in the baseline, see `maximum_baseline_distance()`.
+    max_baseline: usize,
+    /// Length of `other_seq` at the last extension.
+    /// A diagonal that stopped before this position stopped on a mismatch or the baseline end.
+    /// Because `other_seq` only grows, only diagonals at this frontier can extend again.
+    extended_len: usize,
+    /// Bit `i` is set when `wavefront[i] + offset == extended_len`, i.e., diagonal `i` is at the frontier.
+    /// `None` when unknown (after `set_offset()`) or when the wavefront is wider than `FRONTIER_BITS`.
+    frontier: Option<u128>,
 }
+
+/// The widest wavefront that the `frontier` bitmask can track.
+const FRONTIER_BITS: usize = u128::BITS as usize;
 
 impl Default for DWFALite {
     fn default() -> Self {
@@ -88,6 +102,11 @@ impl Default for DWFALite {
             edit_distance: 0,
             wavefront: vec![0],
             offset: 0,
+            max_wavefront: 0,
+            max_baseline: 0,
+            extended_len: 0,
+            // the single diagonal is at `other_seq` position 0, which is the frontier
+            frontier: Some(1),
         }
     }
 }
@@ -110,6 +129,9 @@ impl DWFALite {
     /// * `offset` - the number of characters to ignore
     pub fn set_offset(&mut self, offset: usize) {
         self.offset = offset;
+        // the frontier is relative to the offset, so the next extension must visit every diagonal
+        self.extended_len = 0;
+        self.frontier = None;
     }
 
     /// This is the main function to extend the WFA with a new symbol.
@@ -128,8 +150,8 @@ impl DWFALite {
             DWFALiteState::Active => {}
         };
 
-        // maximally extend everything along the current diagonals
-        self.extend(baseline_seq, other_seq)?;
+        // maximally extend the diagonals at the frontier; the others cannot move
+        self.extend(baseline_seq, other_seq, false);
         
         // check how it looks
         let mut maximum_distance = self.maximum_other_distance();
@@ -155,53 +177,69 @@ impl DWFALite {
     }
 
     /// This will take the current wavefront and try to extend each one along it's current diagonal.
-    /// In most cases, this will not do much work.
+    /// It also refreshes the cached maxima.
     /// This should also be stable such that calling it after finalizing has no impact.
     /// # Arguments
     /// * `baseline_seq` - the baseline sequence, theoretically fixed
     /// * `other_seq` - the other sequence, typically getting updates
-    /// # Errors
-    /// * None so far
-    fn extend(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-        for (i, d) in self.wavefront.iter_mut().enumerate() {
-            // `i` is the index in the wavefront
-            // `i // 2` is always the middle diagonal
-            // anything less than that has used more baseline symbols
-            // anything more than that has used more other symbols
-            // anything above or below needs to shift the comparison
+    /// * `all_diagonals` - if false, only diagonals at the last extended length of `other_seq` are visited
+    fn extend(&mut self, baseline_seq: &[u8], other_seq: &[u8], all_diagonals: bool) {
+        // `i` is the index in the wavefront
+        // `i // 2` is always the middle diagonal
+        // anything less than that has used more baseline symbols
+        // anything more than that has used more other symbols
+        // example at edit distance 1: baseline offset would equal [d+1, d, d-1], which corresponds to
+        // a skipped base in primary, equal usage, and a skipped base in other
 
-            // for this particular wavefront, extend as far as possible
-            loop {
-                // example at edit distance 1:
-                // baseline offset would equal: [d+1, d, d-1] which corresponds to
-                // a skipped base in primary, equal usage, and a skipped base in other
+        // if we truncate a wavefront (e.g., a bounded size); then `i` below will be too small for every wavefront from the start
+        //     that gets truncated; this means we want the below formula to be `*d + self.edit_distance - (i + truncate_prefix)`
+        //     where `truncate_prefix` is the number we have cut off the front (in total).
+        //     IMPORTANT: this formula will need to get updated everywhere that `baseline_offset` is calculated
 
-                // if we truncate a wavefront (e.g., a bounded size); then `i` below will be too small for every wavefront from the start
-                //     that gets truncated; this means we want the below formula to be `*d + self.edit_distance - (i + truncate_prefix)`
-                //     where `truncate_prefix` is the number we have cut off the front (in total).
-                //     IMPORTANT: this formula will need to get updated everywhere that `baseline_offset` is calculated
+        let edit_distance = self.edit_distance;
+        let offset = self.offset;
+        let wildcard = self.config.wildcard;
+        let other_len = other_seq.len();
 
-                let baseline_offset = *d + self.edit_distance - i;
-                let other_offset = *d + self.offset;
-                if baseline_offset >= baseline_seq.len() ||
-                    other_offset >= other_seq.len() ||
-                    (
-                        // not equal 
-                        baseline_seq[baseline_offset] != other_seq[other_offset] && 
-                        // AND baseline is not the configured wildcard
-                        !self.config.wildcard.is_some_and(|wildcard| baseline_seq[baseline_offset] == wildcard)
-                    ) {
-                    // if we are past the end of either sequence OR
-                    // the sequences are not equal at this position THEN
-                    // we are done extending
-                    break;
+        match self.frontier {
+            // a shorter `other_seq` breaks the append-only contract, so that takes the full path below
+            Some(mut bits) if !all_diagonals && other_len >= self.extended_len => {
+                // only the frontier diagonals can move; values only grow, so the cached maxima stay valid lower bounds
+                let mut new_bits: u128 = 0;
+                while bits != 0 {
+                    let i = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let d = &mut self.wavefront[i];
+                    *d += match_length(baseline_seq, other_seq, *d + edit_distance - i, *d + offset, wildcard);
+                    if *d + offset == other_len {
+                        new_bits |= 1 << i;
+                    }
+                    self.max_wavefront = self.max_wavefront.max(*d);
+                    self.max_baseline = self.max_baseline.max(*d + edit_distance - i);
                 }
-
-                // we are not done, so add one to this wavefront
-                *d += 1;
-            }
-        }
-        Ok(())
+                self.frontier = Some(new_bits);
+            },
+            _ => {
+                let frontier = if all_diagonals || other_len < self.extended_len { 0 } else { self.extended_len };
+                let mut max_wavefront = 0;
+                let mut max_baseline = 0;
+                let mut new_bits: u128 = 0;
+                for (i, d) in self.wavefront.iter_mut().enumerate() {
+                    if *d + offset >= frontier {
+                        *d += match_length(baseline_seq, other_seq, *d + edit_distance - i, *d + offset, wildcard);
+                    }
+                    if i < FRONTIER_BITS && *d + offset == other_len {
+                        new_bits |= 1 << i;
+                    }
+                    max_wavefront = max_wavefront.max(*d);
+                    max_baseline = max_baseline.max(*d + edit_distance - i);
+                }
+                self.max_wavefront = max_wavefront;
+                self.max_baseline = max_baseline;
+                self.frontier = (self.wavefront.len() <= FRONTIER_BITS).then_some(new_bits);
+            },
+        };
+        self.extended_len = other_len;
     }
 
     /// This will increase the edit distance for this DWFA and create a new larger wavefront.
@@ -244,8 +282,8 @@ impl DWFALite {
         // finally, save the new wavefront
         self.wavefront = new_wavefront;
 
-        // re-extend
-        self.extend(baseline_seq, other_seq)?;
+        // re-extend; the new entries sit at positions that were never compared, so visit them all
+        self.extend(baseline_seq, other_seq, true);
         Ok(())
     }
 
@@ -284,19 +322,15 @@ impl DWFALite {
 
     /// Helper function that will determine the farthest distance reached into the `baseline_seq` so far.
     pub fn maximum_baseline_distance(&self) -> usize {
-        // baseline distance requires some compute
-        // the 0-index corresponds to deleting `edit_distance` bases in `baseline`, so it has the largest offset
-        // each additional iteration pushes the diagonal closer to inserting bases into `baseline`, so the shift gets progressively smaller
-        self.wavefront.iter().enumerate()
-            .map(|(i, &d)| d + self.edit_distance - i)
-            .max().unwrap()
+        // this is the maximum of `d + edit_distance - i` over the wavefront, cached by `extend()`
+        self.max_baseline
     }
 
     /// Helper function that will determine the farthest distance reached into the `other_seq` so far.
     /// After a public function call, this should be the `other_seq` length unless the edit-distance limit was reached.
     pub fn maximum_other_distance(&self) -> usize {
-        // other distance is directly tracked in our wavefront
-        self.offset + *self.wavefront.iter().max().unwrap()
+        // other distance is directly tracked in our wavefront, cached by `extend()`
+        self.offset + self.max_wavefront
     }
 
     /// Returns true if the farther wavefront in the baseline is at the end
@@ -348,10 +382,125 @@ impl DWFALite {
     }
 }
 
+/// Returns how many symbols match from `baseline_seq[baseline_offset..]` and `other_seq[other_offset..]`.
+/// A baseline symbol equal to `wildcard` matches anything.
+#[inline]
+fn match_length(baseline_seq: &[u8], other_seq: &[u8], baseline_offset: usize, other_offset: usize, wildcard: Option<u8>) -> usize {
+    let (Some(baseline), Some(other)) = (baseline_seq.get(baseline_offset..), other_seq.get(other_offset..)) else {
+        return 0;
+    };
+    match wildcard {
+        Some(wc) => baseline.iter().zip(other.iter())
+            .take_while(|&(&b, &o)| b == o || b == wc)
+            .count(),
+        None => common_prefix_length(baseline, other),
+    }
+}
+
+/// Returns the length of the common prefix of `a` and `b`, comparing 8 bytes at a time.
+#[inline]
+fn common_prefix_length(a: &[u8], b: &[u8]) -> usize {
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    while i + 8 <= n {
+        let x = u64::from_le_bytes(a[i..i + 8].try_into().unwrap());
+        let y = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        let diff = x ^ y;
+        if diff != 0 {
+            // little-endian load, so the lowest set bit is the first mismatched byte
+            return i + (diff.trailing_zeros() / 8) as usize;
+        }
+        i += 8;
+    }
+    while i < n && a[i] == b[i] {
+        i += 1;
+    }
+    i
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cdwfa_config::CdwfaConfig;
+
+    #[test]
+    fn test_common_prefix_length() {
+        assert_eq!(common_prefix_length(b"", b"ACGT"), 0);
+        assert_eq!(common_prefix_length(b"ACGTACGTACGTA", b"ACGTACGTACGTA"), 13);
+        for mismatch in 0..20 {
+            let a = vec![b'A'; 20];
+            let mut b = a.clone();
+            b[mismatch] = b'C';
+            assert_eq!(common_prefix_length(&a, &b), mismatch);
+            assert_eq!(common_prefix_length(&a[..mismatch], &b), mismatch);
+        }
+    }
+
+    /// Edit-distance DP table of `baseline` (rows) against `other` (columns); a baseline `wildcard` matches anything.
+    fn reference_table(baseline: &[u8], other: &[u8], wildcard: Option<u8>) -> Vec<Vec<usize>> {
+        let mut table = vec![vec![0; other.len() + 1]; baseline.len() + 1];
+        for (k, row) in table.iter_mut().enumerate() {
+            row[0] = k;
+        }
+        for (m, cell) in table[0].iter_mut().enumerate() {
+            *cell = m;
+        }
+        for k in 1..=baseline.len() {
+            for m in 1..=other.len() {
+                let is_match = baseline[k-1] == other[m-1] || wildcard == Some(baseline[k-1]);
+                let diagonal = table[k-1][m-1] + usize::from(!is_match);
+                table[k][m] = diagonal.min(table[k-1][m] + 1).min(table[k][m-1] + 1);
+            }
+        }
+        table
+    }
+
+    #[test]
+    fn test_random_against_reference() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let mut max_seen = 0;
+        for trial in 0..300 {
+            let wildcard = if trial % 3 == 0 { Some(b'*') } else { None };
+            let alphabet: &[u8] = if wildcard.is_some() { b"ACGT*" } else { b"ACGT" };
+            let baseline: Vec<u8> = (0..rng.gen_range(0..200)).map(|_| alphabet[rng.gen_range(0..alphabet.len())]).collect();
+            // related pairs keep the distance small; unrelated pairs push it past the frontier bitmask width
+            let mut other: Vec<u8> = if trial % 2 == 0 {
+                baseline.iter().filter(|_| rng.gen_range(0..10) != 0).cloned().collect()
+            } else {
+                (0..rng.gen_range(0..200)).map(|_| b"ACGT"[rng.gen_range(0..4)]).collect()
+            };
+            if other.is_empty() {
+                other.push(b'A');
+            }
+            let offset = if trial % 5 == 0 { rng.gen_range(0..other.len()) } else { 0 };
+
+            let table = reference_table(&baseline, &other[offset..], wildcard);
+            let mut dwfa = DWFALite::new(dwfa_config(wildcard, false, None));
+            if offset > 0 {
+                dwfa.set_offset(offset);
+            }
+            // the first update after an offset sees the whole prefix at once, like `activate_sequence`
+            let first_len = if offset > 0 { offset + 1 } else { 1 };
+            for l in first_len..=other.len() {
+                let expected = (0..=baseline.len()).map(|k| table[k][l - offset]).min().unwrap();
+                assert_eq!(dwfa.update(&baseline, &other[..l]).unwrap(), expected, "trial {trial}, length {l}");
+                // clones must behave the same as the original
+                if l % 7 == 0 {
+                    dwfa = dwfa.clone();
+                }
+            }
+            // `finalize` stops when any diagonal reaches the baseline end, also before the end of `other`.
+            // So it returns the best cost to the baseline end over every prefix of `other`, but never less than before.
+            let update_ed = dwfa.edit_distance();
+            dwfa.finalize(&baseline, &other).unwrap();
+            let best_to_baseline_end = *table[baseline.len()].iter().min().unwrap();
+            assert_eq!(dwfa.edit_distance(), update_ed.max(best_to_baseline_end), "trial {trial}, finalized");
+            max_seen = max_seen.max(dwfa.edit_distance());
+        }
+        // make sure the wide-wavefront fallback was exercised
+        assert!(2 * max_seen + 1 > FRONTIER_BITS);
+    }
 
     fn dwfa_config(wildcard: Option<u8>, allow_early_termination: bool, max_edit_distance: Option<usize>) -> DWFALiteConfig {
         DWFALiteConfigBuilder::default()

@@ -60,7 +60,7 @@ impl Default for DWFALiteConfig {
 /// If the outside sequences are changed in any way other than appending, then this may become desynchronized.
 /// Conceptually, if this is a 2D grid, the baseline sequence will go from top to bottom (y-axis) and the other sequence will go from left to right (x-axis).
 /// This means each character we add to `other_seq` will add a new _column_ to the grid.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Debug, Eq, Hash, PartialEq)]
 pub struct DWFALite {
     /// Fixed matching and edit-distance options for this DWFA.
     config: DWFALiteConfig,
@@ -93,6 +93,43 @@ pub struct DWFALite {
 
 /// The widest wavefront that the `frontier` bitmask can track.
 const FRONTIER_BITS: usize = u128::BITS as usize;
+
+/// Spare wavefront capacity that a clone gets. Clones are usually extended at once, and each edit adds two diagonals.
+/// With spare capacity, the next few edits grow the wavefront in place instead of in a new allocation.
+const CLONE_SPARE_DIAGONALS: usize = 8;
+
+impl Clone for DWFALite {
+    fn clone(&self) -> Self {
+        let mut wavefront = Vec::with_capacity(self.wavefront.len() + CLONE_SPARE_DIAGONALS);
+        wavefront.extend_from_slice(&self.wavefront);
+        DWFALite {
+            config: self.config.clone(),
+            state: self.state,
+            edit_distance: self.edit_distance,
+            wavefront,
+            offset: self.offset,
+            max_wavefront: self.max_wavefront,
+            max_baseline: self.max_baseline,
+            extended_len: self.extended_len,
+            frontier: self.frontier,
+        }
+    }
+
+    /// Reuses the wavefront allocation of `self`.
+    fn clone_from(&mut self, source: &Self) {
+        self.wavefront.clear();
+        self.wavefront.reserve(source.wavefront.len() + CLONE_SPARE_DIAGONALS);
+        self.wavefront.extend_from_slice(&source.wavefront);
+        self.config.clone_from(&source.config);
+        self.state = source.state;
+        self.edit_distance = source.edit_distance;
+        self.offset = source.offset;
+        self.max_wavefront = source.max_wavefront;
+        self.max_baseline = source.max_baseline;
+        self.extended_len = source.extended_len;
+        self.frontier = source.frontier;
+    }
+}
 
 impl Default for DWFALite {
     fn default() -> Self {
@@ -141,7 +178,47 @@ impl DWFALite {
     /// * `other_seq` - the other sequence, typically getting updates
     /// # Errors
     /// * If this function is called after `finalize()` has been called.
+    #[inline]
     pub fn update(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Result<usize, Box<dyn std::error::Error>> {
+        match self.advance_single_frontier(baseline_seq, other_seq) {
+            Some(_) => Ok(self.edit_distance),
+            None => self.update_general(baseline_seq, other_seq),
+        }
+    }
+
+    /// The most common case of `update()`, without the general code. It applies when one symbol was appended,
+    /// exactly one diagonal is at the frontier, and that diagonal matches the new symbol. Then the diagonal moves
+    /// one step, and nothing else changes. It returns the new baseline offset of the diagonal.
+    /// In all other cases, this returns `None` and changes nothing.
+    /// For speed, it only handles a frontier diagonal in the low 64 bits of the bitmask.
+    #[inline(always)]
+    fn advance_single_frontier(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Option<usize> {
+        let bits = self.frontier?;
+        let low_bits = bits as u64;
+        // the last update must have reached the end of `other_seq`, so that the frontier diagonal holds the maximum
+        if self.state != DWFALiteState::Active || (bits >> 64) != 0 || !low_bits.is_power_of_two() ||
+            other_seq.len() != self.extended_len + 1 || self.offset + self.max_wavefront != self.extended_len {
+            return None;
+        }
+        let i = low_bits.trailing_zeros() as usize;
+        // the frontier diagonal is at `extended_len`, so it holds the cached maximum; this saves a dependent load
+        let d = self.max_wavefront;
+        debug_assert_eq!(d, self.wavefront[i]);
+        let baseline_offset = d + self.edit_distance - i;
+        let symbol = *baseline_seq.get(baseline_offset)?;
+        if symbol != other_seq[d + self.offset] && self.config.wildcard != Some(symbol) {
+            return None;
+        }
+        self.wavefront[i] = d + 1;
+        self.max_wavefront = d + 1;
+        self.max_baseline = self.max_baseline.max(baseline_offset + 1);
+        self.extended_len = other_seq.len();
+        Some(baseline_offset + 1)
+    }
+
+    /// `update()` for all cases.
+    #[inline(never)]
+    fn update_general(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Result<usize, Box<dyn std::error::Error>> {
         match self.state {
             DWFALiteState::Finalized => {
                 bail!("Cannot push more bases after finalizing a DWFA");
@@ -266,9 +343,9 @@ impl DWFALite {
         let (edit_distance, offset, wildcard) = (self.edit_distance, self.offset, self.config.wildcard);
         let tracked = self.wavefront.len() + 2 <= FRONTIER_BITS;
         let grown = if tracked {
-            grow_narrow_wavefront(&mut self.wavefront, WavefrontGrower::new(baseline_seq, other_seq, edit_distance, offset, wildcard))
+            grow_wavefront(&mut self.wavefront, WavefrontGrower::new(baseline_seq, other_seq, edit_distance, offset, wildcard))
         } else {
-            grow_wide_wavefront(&mut self.wavefront, WavefrontGrower::new(baseline_seq, other_seq, edit_distance, offset, wildcard))
+            grow_wide_wavefront(&mut self.wavefront, baseline_seq, other_seq, edit_distance, offset, wildcard)
         };
         self.max_wavefront = grown.max_wavefront;
         self.max_baseline = grown.max_baseline;
@@ -469,6 +546,12 @@ struct GrownWavefront {
     frontier: u128,
 }
 
+impl GrownWavefront {
+    fn new() -> GrownWavefront {
+        GrownWavefront { max_wavefront: 0, max_baseline: 0, frontier: 0 }
+    }
+}
+
 // Grows a wavefront by two diagonals for an edit distance that is one larger, then extends each diagonal.
 // Each new diagonal sits at a position that was never compared, so all of them are visited.
 // Each new value is the maximum of up to three old values:
@@ -476,40 +559,14 @@ struct GrownWavefront {
 // * mismatch from diagonal `i - 1`; this progresses both sequences
 // * insertion of a base into `baseline_seq` from diagonal `i - 2`; this progresses `other_seq`
 // Diagonal 0 has only a deletion, diagonal 1 has no insertion, and the two new diagonals at the end have no deletion.
-// There are two versions with the same result:
-// * `grow_narrow_wavefront()` writes a new allocation of the exact size. Narrow wavefronts are mostly clones
-//   without spare capacity, and for those a new allocation is faster than a reallocation.
-// * `grow_wide_wavefront()` grows the wavefront in place. Wide wavefronts mostly belong to one DWFA that grows
-//   many times, e.g., in `finalize()`, so the amortized growth of the `Vec` saves an allocation for most steps.
 
-/// Grows a wavefront into a new allocation and fills `GrownWavefront::frontier`.
-/// The new wavefront must not be wider than `FRONTIER_BITS`.
+/// Grows a wavefront that fits the frontier bitmask, in place, and fills `GrownWavefront::frontier`.
+/// It is filled from the end, so that `wavefront[i - 2..=i]` still holds the old values when diagonal `i` is computed.
+/// The `Vec` grows with amortized doubling, and a clone has spare capacity, so most calls do not allocate.
 #[inline(always)]
-fn grow_narrow_wavefront(wavefront: &mut Vec<usize>, mut grower: WavefrontGrower<'_, true>) -> GrownWavefront {
-    let old = &wavefront[..];
-    let old_len = old.len();
-    debug_assert!(old_len > 0 && old_len + 2 <= FRONTIER_BITS);
-    let mut new_wavefront: Vec<usize> = Vec::with_capacity(old_len + 2);
-    new_wavefront.push(grower.visit(0, old[0]));
-    if old_len >= 2 {
-        new_wavefront.push(grower.visit(1, old[1].max(old[0] + 1)));
-        for (i, w) in (2..).zip(old.windows(3)) {
-            new_wavefront.push(grower.visit(i, w[2].max(w[1] + 1).max(w[0] + 1)));
-        }
-    }
-    let insertion = if old_len >= 2 { old[old_len - 2] + 1 } else { 0 };
-    new_wavefront.push(grower.visit(old_len, (old[old_len - 1] + 1).max(insertion)));
-    new_wavefront.push(grower.visit(old_len + 1, old[old_len - 1] + 1));
-    *wavefront = new_wavefront;
-    grower.grown
-}
-
-/// Grows a wavefront in place. It is filled from the end, so that `wavefront[i - 2..=i]` still holds the old values
-/// when diagonal `i` is computed.
-#[inline(always)]
-fn grow_wide_wavefront(wavefront: &mut Vec<usize>, mut grower: WavefrontGrower<'_, false>) -> GrownWavefront {
+fn grow_wavefront(wavefront: &mut Vec<usize>, mut grower: WavefrontGrower<'_>) -> GrownWavefront {
     let old_len = wavefront.len();
-    debug_assert!(old_len > 0);
+    debug_assert!(old_len > 0 && old_len + 2 <= FRONTIER_BITS);
     wavefront.resize(old_len + 2, 0);
     let wavefront = &mut wavefront[..old_len + 2];
     wavefront[old_len + 1] = grower.visit(old_len + 1, wavefront[old_len - 1] + 1);
@@ -531,9 +588,41 @@ fn grow_wide_wavefront(wavefront: &mut Vec<usize>, mut grower: WavefrontGrower<'
     grower.grown
 }
 
-/// The inputs that each diagonal needs while a wavefront grows. A method, unlike a closure, can be forced inline.
-/// `TRACK_FRONTIER` fills `GrownWavefront::frontier`.
-struct WavefrontGrower<'a, const TRACK_FRONTIER: bool> {
+/// Grows a wide wavefront (without the frontier bitmask) in two passes over a new allocation. The result is the
+/// same as `grow_wavefront()`. Wide wavefronts come from large edit distances, e.g., in `finalize()`, where most
+/// diagonals are past the end of a sequence and can never extend again. A separate pass lets the gather use vector
+/// instructions, and the extension pass skips those diagonals with a well-predicted branch.
+fn grow_wide_wavefront(
+    wavefront: &mut Vec<usize>, baseline_seq: &[u8], other_seq: &[u8], edit_distance: usize, offset: usize, wildcard: Option<u8>
+) -> GrownWavefront {
+    let old = &wavefront[..];
+    let old_len = old.len();
+    debug_assert!(old_len >= 2);
+    let mut new_wavefront: Vec<usize> = Vec::with_capacity(old_len + 2);
+
+    // gather, see `grow_wavefront()` for the three moves
+    new_wavefront.push(old[0]);
+    new_wavefront.push(old[1].max(old[0] + 1));
+    new_wavefront.extend(old.windows(3).map(|w| w[2].max(w[1] + 1).max(w[0] + 1)));
+    new_wavefront.push((old[old_len - 1] + 1).max(old[old_len - 2] + 1));
+    new_wavefront.push(old[old_len - 1] + 1);
+
+    // extend and get the maxima; `match_length()` is 0 for a diagonal at or past the end of either sequence
+    let (baseline_len, other_len) = (baseline_seq.len(), other_seq.len());
+    let mut grown = GrownWavefront::new();
+    for (i, d) in new_wavefront.iter_mut().enumerate() {
+        if *d + offset < other_len && *d + edit_distance - i < baseline_len {
+            *d += match_length(baseline_seq, other_seq, *d + edit_distance - i, *d + offset, wildcard);
+        }
+        grown.max_wavefront = grown.max_wavefront.max(*d);
+        grown.max_baseline = grown.max_baseline.max(*d + edit_distance - i);
+    }
+    *wavefront = new_wavefront;
+    grown
+}
+
+/// The inputs that each diagonal needs while a narrow wavefront grows. A method, unlike a closure, can be forced inline.
+struct WavefrontGrower<'a> {
     baseline_seq: &'a [u8],
     other_seq: &'a [u8],
     edit_distance: usize,
@@ -542,7 +631,7 @@ struct WavefrontGrower<'a, const TRACK_FRONTIER: bool> {
     grown: GrownWavefront,
 }
 
-impl<'a, const TRACK_FRONTIER: bool> WavefrontGrower<'a, TRACK_FRONTIER> {
+impl<'a> WavefrontGrower<'a> {
     #[inline(always)]
     fn new(baseline_seq: &'a [u8], other_seq: &'a [u8], edit_distance: usize, offset: usize, wildcard: Option<u8>) -> Self {
         WavefrontGrower {
@@ -551,7 +640,7 @@ impl<'a, const TRACK_FRONTIER: bool> WavefrontGrower<'a, TRACK_FRONTIER> {
             edit_distance,
             offset,
             wildcard,
-            grown: GrownWavefront { max_wavefront: 0, max_baseline: 0, frontier: 0 },
+            grown: GrownWavefront::new(),
         }
     }
 
@@ -559,7 +648,7 @@ impl<'a, const TRACK_FRONTIER: bool> WavefrontGrower<'a, TRACK_FRONTIER> {
     #[inline(always)]
     fn visit(&mut self, i: usize, d: usize) -> usize {
         let d = d + match_length(self.baseline_seq, self.other_seq, d + self.edit_distance - i, d + self.offset, self.wildcard);
-        if TRACK_FRONTIER && d + self.offset == self.other_seq.len() {
+        if d + self.offset == self.other_seq.len() {
             self.grown.frontier |= 1 << i;
         }
         self.grown.max_wavefront = self.grown.max_wavefront.max(d);

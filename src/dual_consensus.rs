@@ -51,7 +51,7 @@ use std::cmp::{Ordering, Reverse};
 
 use crate::cdwfa_config::{CdwfaConfig, ConsensusCost};
 use crate::consensus::Consensus;
-use crate::dynamic_wfa::{DWFALite, DWFALiteState, ExtensionVotes};
+use crate::dynamic_wfa::{DWFALite, DWFALiteState, VoteBuffers};
 use crate::pqueue_tracker::PQueueTracker;
 use crate::priority_queue::{CachePriority, PriorityQueue};
 
@@ -370,6 +370,16 @@ impl<'a> DualConsensusDWFA<'a> {
             )
         ];
 
+        // buffers that each search step reuses
+        let mut vote_buffers = VoteBuffers::default();
+        let mut extension_candidates1: Vec<(u8, f64)> = vec![];
+        let mut extension_candidates2: Vec<(u8, f64)> = vec![];
+        let mut opt_ec1: Vec<Option<u8>> = vec![];
+        let mut opt_ec2: Vec<Option<u8>> = vec![];
+        let mut extension_pairs: Vec<(Option<u8>, Option<u8>)> = vec![];
+        let mut children: Vec<NodeExtension> = vec![];
+        let mut sorted_candidates: Vec<(Reverse<f64>, u8)> = vec![];
+
         // the way this will work is that we will eventually find one or more answers and anything worse will get drained off until no possibilities remain
         let mut iteration = 0;
         while !pqueue.is_empty() {
@@ -551,12 +561,12 @@ impl<'a> DualConsensusDWFA<'a> {
             // this fetches the list of options according to the WFA so far
             // NOTE: this CAN include the wildcard, but only if the wildcard is the only character
             let weighted_by_ed = self.config.weighted_by_ed;
-            let extension_candidates1 = top_node.get_extension_candidates(&self.sequences, self.config.wildcard, true, weighted_by_ed);
+            top_node.get_extension_candidates(&self.sequences, self.config.wildcard, true, weighted_by_ed, &mut vote_buffers, &mut extension_candidates1);
             // let min_count1 = active_min_count[top_len];
             let min_count1 = self.config.min_count.max(
-                (self.config.min_af * extension_candidates1.values().sum::<f64>()).ceil() as u64
+                (self.config.min_af * extension_candidates1.iter().map(|&(_symbol, count)| count).sum::<f64>()).ceil() as u64
             );
-            let max_observed1 = extension_candidates1.values().cloned().max_by(|a, b| a.total_cmp(b))
+            let max_observed1 = extension_candidates1.iter().map(|&(_symbol, count)| count).max_by(|a, b| a.total_cmp(b))
                 // if no observation, then just use min count
                 .unwrap_or(min_count1 as f64);
             
@@ -565,12 +575,12 @@ impl<'a> DualConsensusDWFA<'a> {
 
             if top_node.is_dual {
                 // get the second candidate set also
-                let extension_candidates2 = top_node.get_extension_candidates(&self.sequences, self.config.wildcard, false, weighted_by_ed);
+                top_node.get_extension_candidates(&self.sequences, self.config.wildcard, false, weighted_by_ed, &mut vote_buffers, &mut extension_candidates2);
                 // let min_count2 = active_min_count[top_len];
                 let min_count2 = self.config.min_count.max(
-                    (self.config.min_af * extension_candidates2.values().sum::<f64>()).ceil() as u64
+                    (self.config.min_af * extension_candidates2.iter().map(|&(_symbol, count)| count).sum::<f64>()).ceil() as u64
                 );
-                let max_observed2 = extension_candidates2.values().cloned().max_by(|a, b| a.total_cmp(b))
+                let max_observed2 = extension_candidates2.iter().map(|&(_symbol, count)| count).max_by(|a, b| a.total_cmp(b))
                     // if no observation, then just use min count
                     .unwrap_or(min_count2 as f64);
             
@@ -587,63 +597,46 @@ impl<'a> DualConsensusDWFA<'a> {
                 trace!("\tec2: {extension_candidates2:?}, {active_threshold2}");
 
                 // now create adjust extension lists that can have None
-                let opt_ec1: Vec<Option<u8>> = {
-                    let mut v = vec![];
-                    // if consensus 1 has at least one final candidate OR the candidate list is empty OR it's already locked
-                    // THEN we need the no-extend option None
-                    if is_con1_finalized || extension_candidates1.is_empty() || top_node.is_con1_locked() {
-                        v.push(None);
-                    }
+                opt_ec1.clear();
+                // if consensus 1 has at least one final candidate OR the candidate list is empty OR it's already locked
+                // THEN we need the no-extend option None
+                if is_con1_finalized || extension_candidates1.is_empty() || top_node.is_con1_locked() {
+                    opt_ec1.push(None);
+                }
 
-                    // do not add extensions if we are sequence locked
-                    if !top_node.is_con1_locked() {
-                        v.extend(extension_candidates1.iter()
-                            .filter_map(|(&symbol, &count)| {
-                                // if this character occurs fewer than the threshold times, remove it from the candidate set
-                                if count < active_threshold1 {
-                                    None
-                                } else {
-                                    // double Some is because of filter_map
-                                    Some(Some(symbol))
-                                }
-                            })
-                        );
-                    }
-                    v
-                };
-
-                let opt_ec2: Vec<Option<u8>> = {
-                    let mut v = vec![];
-                    // if consensus 2 has at least one final candidate OR the candidate list is empty OR it's already locked
-                    // then we need the no-extend option None
-                    if is_con2_finalized || extension_candidates2.is_empty() || top_node.is_con2_locked() {
-                        v.push(None);
-                    }
-
-                    // do not add extensions if we are sequence locked
-                    if !top_node.is_con2_locked() {
-                        v.extend(extension_candidates2.iter().filter_map(|(&symbol, &count)| {
-                            // if this character occurs fewer than the threshold times, remove it from the candidate set
-                            if count < active_threshold2 {
-                                None
-                            } else {
-                                // double Some is because of filter_map
-                                Some(Some(symbol))
-                            }
-                        })
+                // do not add extensions if we are sequence locked
+                if !top_node.is_con1_locked() {
+                    // if this character occurs fewer than the threshold times, remove it from the candidate set
+                    opt_ec1.extend(extension_candidates1.iter()
+                        .filter(|&&(_symbol, count)| count >= active_threshold1)
+                        .map(|&(symbol, _count)| Some(symbol))
                     );
-                    }
-                    v
-                };
+                }
+
+                opt_ec2.clear();
+                // if consensus 2 has at least one final candidate OR the candidate list is empty OR it's already locked
+                // then we need the no-extend option None
+                if is_con2_finalized || extension_candidates2.is_empty() || top_node.is_con2_locked() {
+                    opt_ec2.push(None);
+                }
+
+                // do not add extensions if we are sequence locked
+                if !top_node.is_con2_locked() {
+                    // if this character occurs fewer than the threshold times, remove it from the candidate set
+                    opt_ec2.extend(extension_candidates2.iter()
+                        .filter(|&&(_symbol, count)| count >= active_threshold2)
+                        .map(|&(symbol, _count)| Some(symbol))
+                    );
+                }
 
                 // make sure we always have something in each
                 assert!(!opt_ec1.is_empty() && !opt_ec2.is_empty());
 
                 // pair wise add each extension; we have to extend at least one of them or else it's the exact same node
-                let extension_pairs: Vec<(Option<u8>, Option<u8>)> = opt_ec1.iter()
+                extension_pairs.clear();
+                extension_pairs.extend(opt_ec1.iter()
                     .flat_map(|&opt_can1| opt_ec2.iter().map(move |&opt_can2| (opt_can1, opt_can2)))
-                    .filter(|(opt_can1, opt_can2)| opt_can1.is_some() || opt_can2.is_some())
-                    .collect();
+                    .filter(|(opt_can1, opt_can2)| opt_can1.is_some() || opt_can2.is_some()));
 
                 // the last child takes `top_node` instead of a clone
                 let num_children = extension_pairs.len();
@@ -694,32 +687,29 @@ impl<'a> DualConsensusDWFA<'a> {
                 // this is currently a non-dual node
                 // first, handle the option where it stays as non-dual
                 trace!("\tec1: {extension_candidates1:?}, {active_threshold1}");
-                let mut children: Vec<NodeExtension> = extension_candidates1.iter()
+                children.clear();
+                children.extend(extension_candidates1.iter()
                     // a symbol that was not observed enough times is skipped to reduce overhead
-                    .filter(|&(_symbol, &count)| count >= active_threshold1)
-                    .map(|(&symbol, _count)| NodeExtension::Single(symbol))
-                    .collect();
+                    .filter(|&&(_symbol, count)| count >= active_threshold1)
+                    .map(|&(symbol, _count)| NodeExtension::Single(symbol)));
 
                 // now handle dual-node generation
                 let mut num_passing = 0;
-                let sorted_candidates = {
-                    let mut sc: Vec<_> = extension_candidates1.iter()
-                        .filter_map(|(&c, &count)| {
-                            // when it comes to dual splitting nodes, we care about hitting the minimum count
-                            if self.config.wildcard.is_some() && c == self.config.wildcard.unwrap() {
-                                // this is the wildcard, we do not count it for the purpose of dual splitting
-                                None
-                            } else {
-                                if count >= min_count1 as f64 {
-                                    num_passing += 1;
-                                }
-                                Some((Reverse(count), c))
+                sorted_candidates.clear();
+                sorted_candidates.extend(extension_candidates1.iter()
+                    .filter_map(|&(c, count)| {
+                        // when it comes to dual splitting nodes, we care about hitting the minimum count
+                        if self.config.wildcard.is_some() && c == self.config.wildcard.unwrap() {
+                            // this is the wildcard, we do not count it for the purpose of dual splitting
+                            None
+                        } else {
+                            if count >= min_count1 as f64 {
+                                num_passing += 1;
                             }
-                        })
-                        .collect();
-                    sc.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                    sc
-                };
+                            Some((Reverse(count), c))
+                        }
+                    }));
+                sorted_candidates.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
                 if num_passing > 1 {
                     // c1 in outer loop
@@ -1384,14 +1374,20 @@ impl DualConsensusNode {
         }
     }
 
-    /// Returns a hashmap of the extension candidates with their votes.
+    /// Writes the extension candidates with their votes into `candidates`, in the iteration order of the
+    /// candidate map that this function returned before.
     /// The votes are fractional if a sequence has multiple equally likely options.
     /// # Arguments
     /// * `baseline_sequences` - the sequences that are fixed that we want the consensus of
     /// * `wildcard` - an optional wildcard character, will be removed from return set unless it is the only value in it
     /// * `is_consensus1` - if True, this will check consensus1 DWFAs, otherwise it checks those for consensus2
     /// * `weighted_by_ed` - if True, then the weights are scaled based on the dual weights comparison; e.g. if ed1 = 2 and ed2 = 4, then weights for consensus 1 are ~1/3 and for consensus 2 are ~2/3 of the total
-    fn get_extension_candidates(&self, baseline_sequences: &[&[u8]], wildcard: Option<u8>, is_consensus1: bool, weighted_by_ed: bool) -> HashMap<u8, f64> {
+    /// * `vote_buffers` - reusable buffers for the votes
+    /// * `candidates` - output buffer; it is cleared first
+    fn get_extension_candidates(
+        &self, baseline_sequences: &[&[u8]], wildcard: Option<u8>, is_consensus1: bool, weighted_by_ed: bool,
+        vote_buffers: &mut VoteBuffers, candidates: &mut Vec<(u8, f64)>
+    ) {
         // get the relevant DWFAs
         let dwfa_iter = if is_consensus1 {
             self.dwfas1.iter()
@@ -1414,29 +1410,19 @@ impl DualConsensusNode {
         };
 
         // now pull out all the candidates and count how many times they were voted on
-        let mut votes = ExtensionVotes::default();
-        let mut symbols: Vec<u8> = Vec::with_capacity(16);
+        vote_buffers.clear();
         for (seq_index, (&baseline_seq, opt_dwfa)) in baseline_sequences.iter().zip(dwfa_iter).enumerate() {
             let weight = weights.as_ref().map_or(1.0, |w| w[seq_index]);
             if weight > 0.0 {
                 if let Some(dwfa) = opt_dwfa {
                     // each DWFA splits one weighted vote over the symbols it nominates
-                    symbols.clear();
-                    dwfa.extension_symbols(baseline_seq, consensus_seq, &mut symbols);
-                    votes.add(&symbols, weight);
+                    vote_buffers.add(dwfa, baseline_seq, consensus_seq, weight);
                 }
             }
         }
 
-        let mut candidates = votes.into_map();
-        if let Some(wc) = wildcard {
-            if candidates.len() > 1 {
-                // we have 2+ candidates, we can safely remove the wildcard and have something left over
-                candidates.remove(&wc);
-            }
-        }
-
-        candidates
+        // with 2+ candidates, the wildcard is removed, so something is left over
+        vote_buffers.candidates(wildcard, candidates);
     }
 
     /// This returns a series of weights that are scaled based on the edit distances to con1 and con2.

@@ -52,6 +52,7 @@ use std::cmp::{Ordering, Reverse};
 use crate::cdwfa_config::{CdwfaConfig, ConsensusCost};
 use crate::consensus::Consensus;
 use crate::dynamic_wfa::{DWFALite, DWFALiteState, VoteBuffers};
+use crate::node_pool::NodePool;
 use crate::pqueue_tracker::PQueueTracker;
 use crate::priority_queue::{CachePriority, PriorityQueue};
 
@@ -371,6 +372,7 @@ impl<'a> DualConsensusDWFA<'a> {
         ];
 
         // buffers that each search step reuses
+        let mut node_pool = NodePool::new();
         let mut vote_buffers = VoteBuffers::default();
         let mut extension_candidates1: Vec<(u8, f64)> = vec![];
         let mut extension_candidates2: Vec<(u8, f64)> = vec![];
@@ -427,6 +429,7 @@ impl<'a> DualConsensusDWFA<'a> {
                 top_node.is_dual_imbalanced(active_min_count[top_len] as usize) {
                 nodes_ignored += 1;
                 trace!("\tignored {} || {} || {}", top_cost.0.0 > maximum_error, top_len < threshold_cutoff, top_node.is_dual_imbalanced(active_min_count[top_node.max_consensus_length()] as usize));
+                node_pool.recycle(top_node);
                 continue;
             }
 
@@ -481,10 +484,12 @@ impl<'a> DualConsensusDWFA<'a> {
             */
 
             // now check if this node has reached the end
-            if top_node.reached_all_end(&self.sequences, self.config.allow_early_termination) {
+            let reached_all_end = top_node.reached_all_end_quick(&self.sequences, self.config.allow_early_termination);
+            debug_assert_eq!(reached_all_end, top_node.reached_all_end(&self.sequences, self.config.allow_early_termination));
+            if reached_all_end {
                 // this node *might* be done, we need to finalize it to be sure
                 // we also need to do it in a clone since it might not be finalized and we need to keep extending
-                let mut finalized_node = top_node.clone();
+                let mut finalized_node = node_pool.clone_node(&top_node);
                 finalized_node.finalize(&self.sequences)?;
 
                 // check if this is a dual node, but without enough support on each allele
@@ -535,6 +540,7 @@ impl<'a> DualConsensusDWFA<'a> {
                     // note that it may still be a candidate for extension though
                     trace!("Finalized node is imbalanced, ignoring.");
                 }
+                node_pool.recycle(finalized_node);
             }
 
             // everything past this point is about extending the top_node further
@@ -590,8 +596,10 @@ impl<'a> DualConsensusDWFA<'a> {
                 // one thing we have to handle here is the situation where alleles are different length
                 // this means one might want more extensions and the other is all done
                 // so lets check if either allele is ready to be done
-                let is_con1_finalized = top_node.reached_consensus_end(&self.sequences, true, self.config.allow_early_termination);
-                let is_con2_finalized = top_node.reached_consensus_end(&self.sequences, false, self.config.allow_early_termination);
+                let is_con1_finalized = top_node.reached_consensus_end_quick(&self.sequences, true, self.config.allow_early_termination);
+                let is_con2_finalized = top_node.reached_consensus_end_quick(&self.sequences, false, self.config.allow_early_termination);
+                debug_assert_eq!(is_con1_finalized, top_node.reached_consensus_end(&self.sequences, true, self.config.allow_early_termination));
+                debug_assert_eq!(is_con2_finalized, top_node.reached_consensus_end(&self.sequences, false, self.config.allow_early_termination));
 
                 trace!("\tec1: {extension_candidates1:?}, {active_threshold1}");
                 trace!("\tec2: {extension_candidates2:?}, {active_threshold2}");
@@ -647,7 +655,7 @@ impl<'a> DualConsensusDWFA<'a> {
                     let mut new_node = if child_index + 1 == num_children {
                         parent.take().unwrap()
                     } else {
-                        parent.as_ref().unwrap().clone()
+                        node_pool.clone_node(parent.as_ref().unwrap())
                     };
 
                     // the filter above enforces that at least one of these `if` statements are executed
@@ -682,6 +690,10 @@ impl<'a> DualConsensusDWFA<'a> {
                     assert!(new_node.is_dual);
                     dual_tracker.insert(new_node.max_consensus_length()); // top_node is already dual
                     pqueue.push(new_node);
+                }
+                // without children, `top_node` is dropped
+                if let Some(node) = parent {
+                    node_pool.recycle(node);
                 }
             } else {
                 // this is currently a non-dual node
@@ -732,7 +744,7 @@ impl<'a> DualConsensusDWFA<'a> {
                     let mut new_node = if child_index + 1 == num_children {
                         parent.take().unwrap()
                     } else {
-                        parent.as_ref().unwrap().clone()
+                        node_pool.clone_node(parent.as_ref().unwrap())
                     };
 
                     match child {
@@ -765,6 +777,10 @@ impl<'a> DualConsensusDWFA<'a> {
                         },
                     };
                     pqueue.push(new_node);
+                }
+                // without children, `top_node` is dropped
+                if let Some(node) = parent {
+                    node_pool.recycle(node);
                 }
             }
 
@@ -844,7 +860,7 @@ enum NodeExtension {
     Dual(u8, u8),
 }
 
-#[derive(Clone, Debug, Eq)]
+#[derive(Debug, Eq)]
 struct DualConsensusNode {
     /// if True, then this node is tracking two consensuses
     is_dual: bool,
@@ -852,6 +868,13 @@ struct DualConsensusNode {
     is_con1_locked: bool,
     /// if True, we are not allowed to modify consensus2 anymore
     is_con2_locked: bool,
+    /// False when no DWFA of consensus 1 is at the end of its baseline sequence. True when one may be at the end.
+    /// `push()` sets it exactly, because it updates every DWFA of the consensus. `activate_dual()` pushes both
+    /// consensuses after it copies the DWFAs, so both flags are exact after it. Pruning only removes DWFAs, so a flag
+    /// stays valid. An activation sets both flags to true. See `reached_all_end_quick()`.
+    maybe_at_end1: bool,
+    /// The same as `maybe_at_end1`, for consensus 2
+    maybe_at_end2: bool,
     /// The primary consensus sequence
     consensus1: Vec<u8>,
     /// The secondary consensus sequence
@@ -862,6 +885,37 @@ struct DualConsensusNode {
     dwfas2: Vec<Option<DWFALite>>,
     /// Rank in the search heap: lower cost, then longer consensus, then earlier tie-breaker. Set by `cache_priority`.
     queued_priority: NodePriority,
+}
+
+impl Clone for DualConsensusNode {
+    fn clone(&self) -> Self {
+        DualConsensusNode {
+            is_dual: self.is_dual,
+            is_con1_locked: self.is_con1_locked,
+            is_con2_locked: self.is_con2_locked,
+            maybe_at_end1: self.maybe_at_end1,
+            maybe_at_end2: self.maybe_at_end2,
+            consensus1: self.consensus1.clone(),
+            consensus2: self.consensus2.clone(),
+            dwfas1: self.dwfas1.clone(),
+            dwfas2: self.dwfas2.clone(),
+            queued_priority: self.queued_priority,
+        }
+    }
+
+    /// Reuses the buffers of `self`, down to the DWFA wavefronts; see `NodePool`.
+    fn clone_from(&mut self, source: &Self) {
+        self.is_dual = source.is_dual;
+        self.is_con1_locked = source.is_con1_locked;
+        self.is_con2_locked = source.is_con2_locked;
+        self.maybe_at_end1 = source.maybe_at_end1;
+        self.maybe_at_end2 = source.maybe_at_end2;
+        self.consensus1.clone_from(&source.consensus1);
+        self.consensus2.clone_from(&source.consensus2);
+        self.dwfas1.clone_from(&source.dwfas1);
+        self.dwfas2.clone_from(&source.dwfas2);
+        self.queued_priority = source.queued_priority;
+    }
 }
 
 // The following Eq and Ord implementations are specifically for the Binary Heap.
@@ -923,6 +977,8 @@ impl DualConsensusNode {
             is_dual: false,
             is_con1_locked: false,
             is_con2_locked: false,
+            maybe_at_end1: true,
+            maybe_at_end2: true,
             consensus1: vec![],
             consensus2: vec![],
             dwfas1: dwfas,
@@ -940,6 +996,10 @@ impl DualConsensusNode {
     /// * `config` - consensus configuration, including wildcard, early termination, and the edit-distance cap
     fn activate_sequence(&mut self, sequence: &[u8], seq_index: usize, offset_window: usize, offset_compare_length: usize, config: &CdwfaConfig) -> Result<(), Box<dyn std::error::Error>> {
         // figure out whether we need to just do con1 or both
+        // a new DWFA may be at its end
+        self.maybe_at_end1 = true;
+        self.maybe_at_end2 = true;
+
         let activators = if self.is_dual {
             vec![(&mut self.dwfas1, &self.consensus1), (&mut self.dwfas2, &self.consensus2)]
         } else {
@@ -1011,11 +1071,18 @@ impl DualConsensusNode {
         // first extend the consensus
         consensus_seq.push(symbol);
 
-        // now adjust the corresponding DWFA
+        // now adjust the corresponding DWFA; this updates every DWFA of the consensus, so the end flag is exact
+        let mut maybe_at_end = false;
         for (&baseline, opt_dwfa) in baseline_sequences.iter().zip(dwfa_iter) {
             if let Some(dwfa) = opt_dwfa {
                 dwfa.update(baseline, consensus_seq)?;
+                maybe_at_end |= dwfa.reached_baseline_end(baseline);
             }
+        }
+        if is_consensus1 {
+            self.maybe_at_end1 = maybe_at_end;
+        } else {
+            self.maybe_at_end2 = maybe_at_end;
         }
         Ok(())
     }
@@ -1332,6 +1399,25 @@ impl DualConsensusNode {
         } else {
             iter_map.any(|b| b)
         }
+    }
+
+    /// `reached_all_end()`, but without a pass over the reads when no DWFA can be at its end
+    fn reached_all_end_quick(&self, baseline_sequences: &[&[u8]], require_all: bool) -> bool {
+        // without `require_all`, a read must have a DWFA at its end
+        if !require_all && !self.maybe_at_end1 && !self.maybe_at_end2 {
+            return false;
+        }
+        self.reached_all_end(baseline_sequences, require_all)
+    }
+
+    /// `reached_consensus_end()`, but without a pass over the reads when no DWFA of the consensus can be at its end
+    fn reached_consensus_end_quick(&self, baseline_sequences: &[&[u8]], is_consensus1: bool, require_all: bool) -> bool {
+        // without `require_all`, an active DWFA of the consensus must be at its end
+        let maybe_at_end = if is_consensus1 { self.maybe_at_end1 } else { self.maybe_at_end2 };
+        if !require_all && !maybe_at_end {
+            return false;
+        }
+        self.reached_consensus_end(baseline_sequences, is_consensus1, require_all)
     }
 
     /// For the given consensus, returns true if at least one *active* DWFA at the end of the baseline sequences.

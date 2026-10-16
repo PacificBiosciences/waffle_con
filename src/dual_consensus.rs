@@ -639,63 +639,39 @@ impl<'a> DualConsensusDWFA<'a> {
                 // make sure we always have something in each
                 assert!(!opt_ec1.is_empty() && !opt_ec2.is_empty());
 
-                for opt_can1 in opt_ec1.iter() {
-                    for opt_can2 in opt_ec2.iter() {
-                        if opt_can1.is_none() && opt_can2.is_none() {
-                            // we have to extend at least one of them or else it's the exact same node
-                            continue;
-                        }
+                // pair wise add each extension; we have to extend at least one of them or else it's the exact same node
+                let extension_pairs: Vec<(Option<u8>, Option<u8>)> = opt_ec1.iter()
+                    .flat_map(|&opt_can1| opt_ec2.iter().map(move |&opt_can2| (opt_can1, opt_can2)))
+                    .filter(|(opt_can1, opt_can2)| opt_can1.is_some() || opt_can2.is_some())
+                    .collect();
 
-                        trace!("\tExtending with: {opt_can1:?} + {opt_can2:?}");
+                // the last child takes `top_node` instead of a clone
+                let num_children = extension_pairs.len();
+                let mut parent = Some(top_node);
+                for (child_index, &(opt_can1, opt_can2)) in extension_pairs.iter().enumerate() {
+                    trace!("\tExtending with: {opt_can1:?} + {opt_can2:?}");
 
-                        // pair wise add each extension; above check enforces that at least one of these `if` statements are executed
-                        let mut new_node = top_node.clone();
-                        if let Some(c1) = opt_can1 {
-                            // we have a base to add
-                            new_node.push(&self.sequences, *c1, true)?;
-                        } else {
-                            // we don't, lock the sequence in place so we do not get duplicate nodes
-                            new_node.lock_sequence(true);
-                        }
-                        if let Some(c2) = opt_can2 {
-                            // we have a base to add
-                            new_node.push(&self.sequences, *c2, false)?;
-                        } else {
-                            // we don't, lock the sequence in place so we do not get duplicate nodes
-                            new_node.lock_sequence(false);
-                        }
+                    let mut new_node = if child_index + 1 == num_children {
+                        parent.take().unwrap()
+                    } else {
+                        parent.as_ref().unwrap().clone()
+                    };
 
-                        // check if we need to activate any strings
-                        let opt_activate_list = activate_points.get(&new_node.max_consensus_length());
-                        if let Some(activate_list) = opt_activate_list {
-                            assert!(!activate_list.is_empty());
-                            for &seq_index in activate_list.iter() {
-                                new_node.activate_sequence(self.sequences[seq_index], seq_index, offset_window, offset_compare_length, &self.config)?;
-                            }
-                        }
-
-                        // check if we can prune anything after extensions
-                        new_node.prune_dwfa(self.config.dual_max_ed_delta)?;
-
-                        // get the new cost and put it in the queue
-                        assert!(new_node.is_dual);
-                        dual_tracker.insert(new_node.max_consensus_length()); // top_node is already dual
-                        pqueue.push(new_node);
+                    // the filter above enforces that at least one of these `if` statements are executed
+                    if let Some(c1) = opt_can1 {
+                        // we have a base to add
+                        new_node.push(&self.sequences, c1, true)?;
+                    } else {
+                        // we don't, lock the sequence in place so we do not get duplicate nodes
+                        new_node.lock_sequence(true);
                     }
-                }
-            } else {
-                // this is currently a non-dual node
-                // first, handle the option where it stays as non-dual
-                trace!("\tec1: {extension_candidates1:?}, {active_threshold1}");
-                for (&symbol, &count) in extension_candidates1.iter() {
-                    if count < active_threshold1 {
-                        // this symbol was not observed enough times, skip it to reduce overhead
-                        continue;
+                    if let Some(c2) = opt_can2 {
+                        // we have a base to add
+                        new_node.push(&self.sequences, c2, false)?;
+                    } else {
+                        // we don't, lock the sequence in place so we do not get duplicate nodes
+                        new_node.lock_sequence(false);
                     }
-
-                    // clone and add the symbol
-                    let mut new_node = top_node.clone();
-                    new_node.push(&self.sequences, symbol, true)?;
 
                     // check if we need to activate any strings
                     let opt_activate_list = activate_points.get(&new_node.max_consensus_length());
@@ -706,11 +682,23 @@ impl<'a> DualConsensusDWFA<'a> {
                         }
                     }
 
+                    // check if we can prune anything after extensions
+                    new_node.prune_dwfa(self.config.dual_max_ed_delta)?;
+
                     // get the new cost and put it in the queue
-                    assert!(!new_node.is_dual);
-                    single_tracker.insert(new_node.max_consensus_length());
+                    assert!(new_node.is_dual);
+                    dual_tracker.insert(new_node.max_consensus_length()); // top_node is already dual
                     pqueue.push(new_node);
                 }
+            } else {
+                // this is currently a non-dual node
+                // first, handle the option where it stays as non-dual
+                trace!("\tec1: {extension_candidates1:?}, {active_threshold1}");
+                let mut children: Vec<NodeExtension> = extension_candidates1.iter()
+                    // a symbol that was not observed enough times is skipped to reduce overhead
+                    .filter(|&(_symbol, &count)| count >= active_threshold1)
+                    .map(|(&symbol, _count)| NodeExtension::Single(symbol))
+                    .collect();
 
                 // now handle dual-node generation
                 let mut num_passing = 0;
@@ -741,34 +729,57 @@ impl<'a> DualConsensusDWFA<'a> {
                             // sanity checks to make sure we never try to make a dual node where one extension is the wildcard
                             assert!(self.config.wildcard.is_none() || c1 != self.config.wildcard.unwrap());
                             assert!(self.config.wildcard.is_none() || c2 != self.config.wildcard.unwrap());
-                            
-                            // convert the clone into a dual node with the candidate; c1 should be the "major" candidate due to the above sort
-                            let mut new_node = top_node.clone();
-                            new_node.activate_dual(&self.sequences, c1, c2)?;
-
-                            // check if we need to activate any strings
-                            let opt_activate_list = activate_points.get(&new_node.max_consensus_length());
-                            if let Some(activate_list) = opt_activate_list {
-                                assert!(!activate_list.is_empty());
-                                for &seq_index in activate_list.iter() {
-                                    new_node.activate_sequence(self.sequences[seq_index], seq_index, offset_window, offset_compare_length, &self.config)?;
-                                }
-                            }
-
-                            // now prune
-                            new_node.prune_dwfa(self.config.dual_max_ed_delta)?;
-
-                            // get the new cost and put it in the queue
-                            assert!(new_node.is_dual);
-                            dual_tracker.insert(new_node.max_consensus_length());
-                            pqueue.push(new_node);
+                            // c1 should be the "major" candidate due to the above sort
+                            children.push(NodeExtension::Dual(c1, c2));
                         }
                     }
                 }
+
+                // the last child takes `top_node` instead of a clone
+                let num_children = children.len();
+                let mut parent = Some(top_node);
+                for (child_index, &child) in children.iter().enumerate() {
+                    let mut new_node = if child_index + 1 == num_children {
+                        parent.take().unwrap()
+                    } else {
+                        parent.as_ref().unwrap().clone()
+                    };
+
+                    match child {
+                        // add the symbol
+                        NodeExtension::Single(symbol) => new_node.push(&self.sequences, symbol, true)?,
+                        // convert the node into a dual node with the candidates
+                        NodeExtension::Dual(c1, c2) => new_node.activate_dual(&self.sequences, c1, c2)?,
+                    };
+
+                    // check if we need to activate any strings
+                    let opt_activate_list = activate_points.get(&new_node.max_consensus_length());
+                    if let Some(activate_list) = opt_activate_list {
+                        assert!(!activate_list.is_empty());
+                        for &seq_index in activate_list.iter() {
+                            new_node.activate_sequence(self.sequences[seq_index], seq_index, offset_window, offset_compare_length, &self.config)?;
+                        }
+                    }
+
+                    // get the new cost and put it in the queue
+                    match child {
+                        NodeExtension::Single(_) => {
+                            assert!(!new_node.is_dual);
+                            single_tracker.insert(new_node.max_consensus_length());
+                        },
+                        NodeExtension::Dual(_, _) => {
+                            // now prune
+                            new_node.prune_dwfa(self.config.dual_max_ed_delta)?;
+                            assert!(new_node.is_dual);
+                            dual_tracker.insert(new_node.max_consensus_length());
+                        },
+                    };
+                    pqueue.push(new_node);
+                }
             }
 
-            // TODO: remove this eventually, it's a summation check
-            assert_eq!(pqueue.len(), single_tracker.unfiltered_len() + dual_tracker.unfiltered_len());
+            // TODO: remove this eventually, it's a summation check; it sums both trackers, so only run it in debug builds
+            debug_assert_eq!(pqueue.len(), single_tracker.unfiltered_len() + dual_tracker.unfiltered_len());
         }
 
         assert_eq!(single_tracker.len(), 0);
@@ -834,6 +845,15 @@ impl<'a> DualConsensusDWFA<'a> {
 }
 
 /// Wrapper for a node containing a partial consensus as well as the DWFA tracking for that node.
+/// One child of a non-dual node, in the order the children are queued.
+#[derive(Clone, Copy, Debug)]
+enum NodeExtension {
+    /// Extend the single consensus with this symbol.
+    Single(u8),
+    /// Split into a dual node; the first symbol is the major candidate.
+    Dual(u8, u8),
+}
+
 #[derive(Clone, Debug, Eq)]
 struct DualConsensusNode {
     /// if True, then this node is tracking two consensuses
@@ -1239,8 +1259,20 @@ impl DualConsensusNode {
 
     /// Returns the total score for the node
     fn total_cost(&self, consensus_cost: ConsensusCost) -> usize {
-        let (_best_indices, best_costs) = self.costs(consensus_cost);
-        best_costs.iter().sum()
+        // same as summing the scores from `costs()`, without the allocations
+        self.dwfas1.iter().zip(self.dwfas2.iter())
+            .map(|(opt_d1, opt_d2)| {
+                [opt_d1, opt_d2].into_iter()
+                    .flatten()
+                    .map(|d| match consensus_cost {
+                        ConsensusCost::L1Distance => d.edit_distance(),
+                        ConsensusCost::L2Distance => d.edit_distance().pow(2)
+                    })
+                    .min()
+                    // a sequence without a DWFA has not been activated yet, and costs 0
+                    .unwrap_or(0)
+            })
+            .sum()
     }
 
     /// Returns the full set of tracked costs for the two consensuses.

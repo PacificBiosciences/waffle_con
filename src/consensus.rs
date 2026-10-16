@@ -345,12 +345,16 @@ impl<'a> ConsensusDWFA<'a> {
                 new_node.push(&self.sequences, passing_candidates[0])?;
                 new_nodes.push(new_node);
             } else {
-                // we have 2+ viable, we have to clone them
-                for symbol in passing_candidates.into_iter() {
+                // we have 2+ viable, we have to clone them; the last one takes `top_node` instead of a clone
+                let (&last_symbol, other_symbols) = passing_candidates.split_last().unwrap();
+                for &symbol in other_symbols.iter() {
                     let mut new_node = top_node.clone();
                     new_node.push(&self.sequences, symbol)?;
                     new_nodes.push(new_node);
                 }
+                let mut new_node = top_node;
+                new_node.push(&self.sequences, last_symbol)?;
+                new_nodes.push(new_node);
             }
 
             // for each need node, do any activations and then add it to the queue
@@ -581,7 +585,14 @@ impl ConsensusNode {
 
     /// Returns the total score for the node
     fn total_cost(&self, consensus_cost: ConsensusCost) -> usize {
-        self.costs(consensus_cost).iter().sum()
+        // same as summing `costs()`, without the allocation; a DWFA that is not initialized costs 0
+        self.dwfas.iter()
+            .flatten()
+            .map(|d| match consensus_cost {
+                ConsensusCost::L1Distance => d.edit_distance(),
+                ConsensusCost::L2Distance => d.edit_distance().pow(2)
+            })
+            .sum()
     }
 
     /// Returns true if any of the dwfas are at the end of their respective baseline sequences

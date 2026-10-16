@@ -48,12 +48,12 @@ use log::{debug, trace, warn};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use simple_error::{bail, SimpleError};
 use std::cmp::{Ordering, Reverse};
-use std::collections::BinaryHeap;
 
 use crate::cdwfa_config::{CdwfaConfig, ConsensusCost};
 use crate::consensus::Consensus;
 use crate::dynamic_wfa::{DWFALite, DWFALiteState};
 use crate::pqueue_tracker::PQueueTracker;
+use crate::priority_queue::{CachePriority, PriorityQueue};
 
 /// We have a max-hap, so (Reverse(edit distance), length).
 /// This mean lowest edit distance first, tie-break with the longest consensus length.
@@ -349,11 +349,9 @@ impl<'a> DualConsensusDWFA<'a> {
         let initial_node = DualConsensusNode::new_root_node(&self.sequences, &offsets, &self.config)?;
 
         // Max-heap ordered by cached priority: lower cost, then longer consensus, then earlier tie-breaker.
-        let mut pqueue: BinaryHeap<DualConsensusNode> = BinaryHeap::new();
-        let mut next_id: u64 = 0;
+        let mut pqueue = PriorityQueue::new(self.consensus_cost());
         single_tracker.insert(initial_node.max_consensus_length());
-        initial_node.enqueue(&mut pqueue, next_id, self.consensus_cost());
-        next_id += 1;
+        pqueue.push(initial_node);
 
         let mut ret: Vec<DualConsensus> = vec![];
         let mut last_indiv = 0;
@@ -390,7 +388,7 @@ impl<'a> DualConsensusDWFA<'a> {
 
             // get the top node and check if it's bad
             let top_node = pqueue.pop().unwrap();
-            let top_cost = top_node.queued_priority;
+            let top_cost = top_node.queued_priority();
             let top_len = top_node.max_consensus_length();
 
             let (threshold_cutoff, at_capacity) = if top_node.is_dual {
@@ -682,8 +680,7 @@ impl<'a> DualConsensusDWFA<'a> {
                         // get the new cost and put it in the queue
                         assert!(new_node.is_dual);
                         dual_tracker.insert(new_node.max_consensus_length()); // top_node is already dual
-                        new_node.enqueue(&mut pqueue, next_id, self.consensus_cost());
-                        next_id += 1;
+                        pqueue.push(new_node);
                     }
                 }
             } else {
@@ -712,8 +709,7 @@ impl<'a> DualConsensusDWFA<'a> {
                     // get the new cost and put it in the queue
                     assert!(!new_node.is_dual);
                     single_tracker.insert(new_node.max_consensus_length());
-                    new_node.enqueue(&mut pqueue, next_id, self.consensus_cost());
-                    next_id += 1;
+                    pqueue.push(new_node);
                 }
 
                 // now handle dual-node generation
@@ -765,8 +761,7 @@ impl<'a> DualConsensusDWFA<'a> {
                             // get the new cost and put it in the queue
                             assert!(new_node.is_dual);
                             dual_tracker.insert(new_node.max_consensus_length());
-                            new_node.enqueue(&mut pqueue, next_id, self.consensus_cost());
-                            next_id += 1;
+                            pqueue.push(new_node);
                         }
                     }
                 }
@@ -855,7 +850,7 @@ struct DualConsensusNode {
     dwfas1: Vec<Option<DWFALite>>,
     /// The set of DWFAs for consensus2; these are options because we stop tracking once the scores diverge
     dwfas2: Vec<Option<DWFALite>>,
-    /// Rank in the search heap: lower cost, then longer consensus, then earlier tie-breaker. Set when the node is enqueued.
+    /// Rank in the search heap: lower cost, then longer consensus, then earlier tie-breaker. Set by `cache_priority`.
     queued_priority: NodePriority,
 }
 
@@ -924,18 +919,6 @@ impl DualConsensusNode {
             dwfas2: vec![None; offsets.len()],
             queued_priority: (Reverse(0), 0, Reverse(0)),
         })
-    }
-
-    /// Caches this node's search priority and moves it into the heap (consuming the node).
-    /// The rank is the current edit-distance cost, then consensus length, then `tie_breaker`.
-    /// A lower tie-breaker was enqueued earlier and wins when cost and length match.
-    /// # Arguments
-    /// * `heap` - the search heap that receives this node
-    /// * `tie_breaker` - tie-breaker value when other values are equal; in practice, used as a incremented ID to get deterministic ordering
-    /// * `consensus_cost` - cost model used to score the node
-    fn enqueue(mut self, heap: &mut BinaryHeap<DualConsensusNode>, tie_breaker: u64, consensus_cost: ConsensusCost) {
-        self.queued_priority = self.priority(consensus_cost, tie_breaker);
-        heap.push(self);
     }
 
     /// This will activate the DWFAs for a particular sequence.
@@ -1280,19 +1263,6 @@ impl DualConsensusNode {
         (s1, s2)
     }
 
-    /// Returns the node priority.
-    /// Rank is 1) lowest cost, 2) consensus length, and 3) earlier tie-breaker.
-    /// # Arguments
-    /// * `consensus_cost` - cost model to evaluate the cost
-    /// * `tie_breaker` - insertion order; a lower value is earlier and wins ties
-    fn priority(&self, consensus_cost: ConsensusCost, tie_breaker: u64) -> NodePriority {
-        (
-            Reverse(self.total_cost(consensus_cost)),
-            self.max_consensus_length(),
-            Reverse(tie_breaker),
-        )
-    }
-
     /// Returns true if each consensus has at least one DWFA at the end of their respective baseline sequences.
     /// # Arguments
     /// * `baseline_sequences` - the sequences that are fixed that we want the consensus of
@@ -1497,11 +1467,29 @@ impl DualConsensusNode {
     fn is_con2_locked(&self) -> bool {
         self.is_con2_locked
     }
+
+    /// Rank cached for the search heap: lower cost, then longer consensus, then earlier tie-breaker.
+    fn queued_priority(&self) -> NodePriority {
+        self.queued_priority
+    }
+}
+
+impl CachePriority for DualConsensusNode {
+    /// Caches this node's search priority.
+    /// Rank is 1) lowest cost, 2) consensus length, and 3) earlier tie-breaker.
+    fn cache_priority(&mut self, consensus_cost: ConsensusCost, tie_breaker: u64) {
+        self.queued_priority = (
+            Reverse(self.total_cost(consensus_cost)),
+            self.max_consensus_length(),
+            Reverse(tie_breaker),
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BinaryHeap;
 
     use std::path::PathBuf;
 
@@ -1525,9 +1513,9 @@ mod tests {
         heap.push(earlier);
         heap.push(cheaper);
 
-        assert_eq!(heap.pop().unwrap().queued_priority.2.0, 2);
-        assert_eq!(heap.pop().unwrap().queued_priority.2.0, 0);
-        assert_eq!(heap.pop().unwrap().queued_priority.2.0, 1);
+        assert_eq!(heap.pop().unwrap().queued_priority().2.0, 2);
+        assert_eq!(heap.pop().unwrap().queued_priority().2.0, 0);
+        assert_eq!(heap.pop().unwrap().queued_priority().2.0, 1);
     }
 
     #[test]

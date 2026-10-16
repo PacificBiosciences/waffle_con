@@ -1,6 +1,7 @@
 
 use rustc_hash::FxHashMap as HashMap;
 use simple_error::bail;
+use std::collections::VecDeque;
 
 /// Lifecycle of a [`DWFALite`].
 /// A DWFA starts [`Active`](DWFALiteState::Active). 
@@ -377,6 +378,28 @@ impl DWFALite {
         Ok(())
     }
 
+    /// Applies all remaining edits of `finalize()` at once. Call it only when no diagonal can extend again, i.e.,
+    /// each diagonal is at or past the end of `other_seq`. Then each edit raises both cached maxima by exactly one,
+    /// so the number of edits up to the baseline end or the cap is known, and `grow_without_matches()` has a closed
+    /// form for the wavefront. The result is the same as from that many calls of `increase_edit_distance()`.
+    /// # Arguments
+    /// * `baseline_len` - the length of the baseline sequence
+    fn finish_without_matches(&mut self, baseline_len: usize) {
+        let mut steps = baseline_len.saturating_sub(self.max_baseline);
+        if let Some(limit) = self.config.max_edit_distance {
+            steps = steps.min(limit.saturating_sub(self.edit_distance));
+        }
+        if steps == 0 {
+            return;
+        }
+        grow_without_matches(&mut self.wavefront, self.edit_distance, steps);
+        self.edit_distance += steps;
+        self.max_wavefront += steps;
+        self.max_baseline += steps;
+        // this only runs for wavefronts that are too wide for the frontier bitmask
+        self.frontier = None;
+    }
+
     /// This function signals that base insertion into `other_seq` is completed.
     /// This will trigger the algorithm to make sure we have reached the end of both the `baseline_seq`, potentially increasing edit distance further.
     /// Note: other_seq should already be at the end UNLESS we allow_early_termination
@@ -397,6 +420,13 @@ impl DWFALite {
             if self.edit_distance_at_limit() {
                 self.state = DWFALiteState::ExceededEditDistanceLimit;
                 return Ok(());
+            }
+            // Once every diagonal is at or past the end of `other_seq`, no diagonal can extend again, and the remaining
+            // edits have a closed form. Values only grow, so this stays true. The scan usually stops at once, on a low
+            // diagonal that has not reached the end. In the worst case, it adds one pass per edit to the growth pass.
+            if self.wavefront.len() > FRONTIER_BITS && self.wavefront.iter().all(|&d| d + self.offset >= other_seq.len()) {
+                self.finish_without_matches(baseline_seq.len());
+                continue;
             }
             // while we have not reached the end of the primary sequence
             self.increase_edit_distance(baseline_seq, other_seq)?;
@@ -840,6 +870,43 @@ fn grow_wide_wavefront(
     grown
 }
 
+/// Applies `steps` growths without matches to `wavefront`, see `grow_wavefront()`.
+/// After `steps` growths, old diagonal `i` gives `old[i] + min(j - i, steps)` to each new diagonal `j` in
+/// `i..=i + 2 * steps`: a step moves a value 0, 1, or 2 diagonals up, and a move of 1 or 2 adds one.
+/// Two sliding maxima cover the rising part (`j - i <= steps`) and the constant part (`j - i >= steps`).
+/// The rising scores `old[i] + edit_distance - i` are the baseline offsets, so they cannot underflow.
+fn grow_without_matches(wavefront: &mut Vec<usize>, edit_distance: usize, steps: usize) {
+    let old = std::mem::take(wavefront);
+    let mut rising: VecDeque<usize> = VecDeque::new();
+    let mut constant: VecDeque<usize> = VecDeque::new();
+    wavefront.reserve(old.len() + 2 * steps);
+    for j in 0..old.len() + 2 * steps {
+        if j < old.len() {
+            let score = old[j] + edit_distance - j;
+            while rising.back().is_some_and(|&i| old[i] + edit_distance - i <= score) {
+                rising.pop_back();
+            }
+            rising.push_back(j);
+        }
+        if j >= steps && j - steps < old.len() {
+            let i = j - steps;
+            while constant.back().is_some_and(|&k| old[k] <= old[i]) {
+                constant.pop_back();
+            }
+            constant.push_back(i);
+        }
+        while rising.front().is_some_and(|&i| i + steps < j) {
+            rising.pop_front();
+        }
+        while constant.front().is_some_and(|&i| i + 2 * steps < j) {
+            constant.pop_front();
+        }
+        let rising_value = rising.front().map_or(0, |&i| old[i] + (j - i));
+        let constant_value = constant.front().map_or(0, |&i| old[i] + steps);
+        wavefront.push(rising_value.max(constant_value));
+    }
+}
+
 /// The inputs that each diagonal needs while a narrow wavefront grows. A method, unlike a closure, can be forced inline.
 struct WavefrontGrower<'a> {
     baseline_seq: &'a [u8],
@@ -916,6 +983,56 @@ fn common_prefix_length(a: &[u8], b: &[u8]) -> usize {
 mod tests {
     use super::*;
     use crate::cdwfa_config::CdwfaConfig;
+
+    /// The closed form of `grow_without_matches()` against growth one edit at a time
+    #[test]
+    fn test_growth_without_matches() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(51);
+        for ed in [0, 1, 2, 63, 64, 129] {
+            for steps in [1, 2, 3, 63, 64, 151] {
+                let mut actual: Vec<usize> = (0..2 * ed + 1)
+                    .map(|i: usize| i.saturating_sub(ed) + rng.gen_range(0..50)).collect();
+                let mut expected = actual.clone();
+                for _ in 0..steps {
+                    let mut next = vec![0; expected.len() + 2];
+                    for (i, &d) in expected.iter().enumerate() {
+                        next[i] = next[i].max(d);
+                        next[i + 1] = next[i + 1].max(d + 1);
+                        next[i + 2] = next[i + 2].max(d + 1);
+                    }
+                    expected = next;
+                }
+                grow_without_matches(&mut actual, ed, steps);
+                assert_eq!(actual, expected, "distance {ed}, steps {steps}");
+            }
+        }
+    }
+
+    /// `finalize()` with the closed form against growth one edit at a time, with caps and offsets
+    #[test]
+    fn test_bulk_finalize_matches_individual_growth() {
+        for cap in [None, Some(63), Some(64), Some(65), Some(200), Some(800)] {
+            for offset in [0, 7] {
+                let baseline = vec![b'A'; 800];
+                let other = vec![b'C'; offset + 30];
+                let mut actual = DWFALite::new(dwfa_config(None, false, cap));
+                actual.set_offset(offset);
+                actual.update(&baseline, &other).unwrap();
+                let mut expected = actual.clone();
+                while expected.max_baseline < baseline.len() && !expected.edit_distance_at_limit() {
+                    expected.increase_edit_distance(&baseline, &other).unwrap();
+                }
+                expected.state = if expected.max_baseline < baseline.len() {
+                    DWFALiteState::ExceededEditDistanceLimit
+                } else {
+                    DWFALiteState::Finalized
+                };
+                actual.finalize(&baseline, &other).unwrap();
+                assert_eq!(actual, expected, "cap {cap:?}, offset {offset}");
+            }
+        }
+    }
 
     #[test]
     fn test_common_prefix_length() {

@@ -51,7 +51,7 @@ use std::cmp::{Ordering, Reverse};
 
 use crate::cdwfa_config::{CdwfaConfig, ConsensusCost};
 use crate::consensus::Consensus;
-use crate::dynamic_wfa::{DWFALite, DWFALiteState};
+use crate::dynamic_wfa::{DWFALite, DWFALiteState, ExtensionVotes};
 use crate::pqueue_tracker::PQueueTracker;
 use crate::priority_queue::{CachePriority, PriorityQueue};
 
@@ -1374,31 +1374,29 @@ impl DualConsensusNode {
             &self.consensus2
         };
 
+        // without ED weighting, every weight is 1.0
         let weights = if weighted_by_ed {
-            self.get_ed_weights(is_consensus1, weighted_by_ed)
+            Some(self.get_ed_weights(is_consensus1, weighted_by_ed))
         } else {
-            // these weights will always factor in current scoring
-            vec![1.0; self.dwfas1.len()]
+            None
         };
 
         // now pull out all the candidates and count how many times they were voted on
-        let mut candidates: HashMap<u8, f64> = Default::default();
-        for ((&baseline_seq, opt_dwfa), &weight) in baseline_sequences.iter().zip(dwfa_iter).zip(weights.iter()) {
+        let mut votes = ExtensionVotes::default();
+        let mut symbols: Vec<u8> = Vec::with_capacity(16);
+        for (seq_index, (&baseline_seq, opt_dwfa)) in baseline_sequences.iter().zip(dwfa_iter).enumerate() {
+            let weight = weights.as_ref().map_or(1.0, |w| w[seq_index]);
             if weight > 0.0 {
                 if let Some(dwfa) = opt_dwfa {
-                    // get the candidates and the total observation weight
-                    let cand = dwfa.get_extension_candidates(baseline_seq, consensus_seq);
-                    let vote_split = cand.values().sum::<usize>() as f64;
-                    
-                    // iterate over each candidate and scale it by the occurrences count / total weight
-                    for (&c, &occ) in cand.iter() {
-                        let entry = candidates.entry(c).or_insert(0.0);
-                        *entry += weight * occ as f64 / vote_split;
-                    }
+                    // each DWFA splits one weighted vote over the symbols it nominates
+                    symbols.clear();
+                    dwfa.extension_symbols(baseline_seq, consensus_seq, &mut symbols);
+                    votes.add(&symbols, weight);
                 }
             }
         }
 
+        let mut candidates = votes.into_map();
         if let Some(wc) = wildcard {
             if candidates.len() > 1 {
                 // we have 2+ candidates, we can safely remove the wildcard and have something left over

@@ -364,6 +364,42 @@ impl DWFALite {
         ret
     }
 
+    /// Appends the symbols that extend this DWFA without increasing the edit distance to `symbols`.
+    /// The order is the wavefront order, which is also the insertion order of `get_extension_candidates()`.
+    /// A symbol is repeated once for each diagonal that nominates it.
+    /// # Arguments
+    /// * `baseline_seq` - the baseline sequence, theoretically fixed
+    /// * `other_seq` - the other sequence, typically getting updates
+    /// * `symbols` - output buffer; existing contents are kept
+    pub(crate) fn extension_symbols(&self, baseline_seq: &[u8], other_seq: &[u8], symbols: &mut Vec<u8>) {
+        if self.state == DWFALiteState::ExceededEditDistanceLimit {
+            return;
+        }
+        match self.frontier {
+            // the bitmask holds exactly the diagonals with `d + offset == other_seq.len()`, in wavefront order
+            Some(mut bits) if other_seq.len() == self.extended_len => {
+                while bits != 0 {
+                    let i = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let offset = self.wavefront[i] + self.edit_distance - i;
+                    if offset < baseline_seq.len() {
+                        symbols.push(baseline_seq[offset]);
+                    }
+                }
+            },
+            _ => {
+                for (i, &d) in self.wavefront.iter().enumerate() {
+                    if d + self.offset == other_seq.len() {
+                        let offset = d + self.edit_distance - i;
+                        if offset < baseline_seq.len() {
+                            symbols.push(baseline_seq[offset]);
+                        }
+                    }
+                }
+            },
+        };
+    }
+
     // Getters below
     pub fn edit_distance(&self) -> usize {
         self.edit_distance
@@ -379,6 +415,59 @@ impl DWFALite {
 
     pub fn state(&self) -> DWFALiteState {
         self.state
+    }
+}
+
+/// Extension votes from several DWFAs.
+/// It gives the same map as voting into a `HashMap<u8, f64>` with `entry()`, but it does one map insertion for each
+/// symbol instead of one map lookup for each DWFA.
+#[derive(Debug, Default)]
+pub(crate) struct ExtensionVotes {
+    /// Votes in order of the first vote for each symbol. The alphabet is small, so a linear search is fast.
+    votes: Vec<(u8, f64)>,
+}
+
+impl ExtensionVotes {
+    /// Adds the votes of one DWFA. Each symbol gets `weight * count / symbols.len()`.
+    /// The symbols get their first votes in the same order as when voting from the map of
+    /// `DWFALite::get_extension_candidates()`. Usually all symbols are equal, and then no map is built.
+    /// # Arguments
+    /// * `symbols` - the output of `DWFALite::extension_symbols()` for one DWFA
+    /// * `weight` - the total weight of this DWFA's vote
+    pub(crate) fn add(&mut self, symbols: &[u8], weight: f64) {
+        let Some(&first) = symbols.first() else {
+            return;
+        };
+        let vote_split = symbols.len() as f64;
+        if symbols.iter().all(|&s| s == first) {
+            self.add_vote(first, weight * symbols.len() as f64 / vote_split);
+        } else {
+            // Colliding keys make the iteration order of the final map depend on insertion order.
+            // Build the same per-DWFA map as before, so the symbols get their first votes in the same order.
+            let mut counts: HashMap<u8, usize> = Default::default();
+            for &s in symbols.iter() {
+                *counts.entry(s).or_insert(0) += 1;
+            }
+            for (&c, &occ) in counts.iter() {
+                self.add_vote(c, weight * occ as f64 / vote_split);
+            }
+        }
+    }
+
+    fn add_vote(&mut self, symbol: u8, vote: f64) {
+        match self.votes.iter_mut().find(|(s, _)| *s == symbol) {
+            Some((_, total)) => *total += vote,
+            None => self.votes.push((symbol, 0.0 + vote)),
+        };
+    }
+
+    /// Converts the votes into a map. Keys are inserted in order of their first vote, as `entry()` would do.
+    pub(crate) fn into_map(self) -> HashMap<u8, f64> {
+        let mut candidates: HashMap<u8, f64> = Default::default();
+        for (symbol, total) in self.votes.into_iter() {
+            candidates.insert(symbol, total);
+        }
+        candidates
     }
 }
 
@@ -500,6 +589,52 @@ mod tests {
         }
         // make sure the wide-wavefront fallback was exercised
         assert!(2 * max_seen + 1 > FRONTIER_BITS);
+    }
+
+    #[test]
+    fn test_extension_votes_match_entry_voting() {
+        // `C` and `G` collide in a small FxHashMap, so key order depends on insertion order; compare order and values
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let alphabet = b"ACGT*N";
+        for _ in 0..2000 {
+            let mut expected: HashMap<u8, f64> = Default::default();
+            let mut votes = ExtensionVotes::default();
+            for _ in 0..rng.gen_range(0..8) {
+                let symbols: Vec<u8> = (0..rng.gen_range(0..4)).map(|_| alphabet[rng.gen_range(0..alphabet.len())]).collect();
+                let weight = [1.0, 0.5, 0.25, 0.9][rng.gen_range(0..4)];
+                // the voting code before `ExtensionVotes`
+                let mut cand: HashMap<u8, usize> = Default::default();
+                for &s in symbols.iter() {
+                    *cand.entry(s).or_insert(0) += 1;
+                }
+                let vote_split = cand.values().sum::<usize>() as f64;
+                for (&c, &occ) in cand.iter() {
+                    *expected.entry(c).or_insert(0.0) += weight * occ as f64 / vote_split;
+                }
+                votes.add(&symbols, weight);
+            }
+            let actual = votes.into_map();
+            let to_bits = |m: &HashMap<u8, f64>| m.iter().map(|(&k, &v)| (k, v.to_bits())).collect::<Vec<_>>();
+            assert_eq!(to_bits(&actual), to_bits(&expected));
+        }
+    }
+
+    #[test]
+    fn test_extension_symbols_match_candidates() {
+        let baseline = b"ACGTTACGGA";
+        let other = b"ACTTAC";
+        let mut dwfa = DWFALite::default();
+        for l in 0..other.len() {
+            dwfa.update(baseline, &other[..(l+1)]).unwrap();
+        }
+        let mut symbols = vec![];
+        dwfa.extension_symbols(baseline, other, &mut symbols);
+        let mut counts: HashMap<u8, usize> = Default::default();
+        for &s in symbols.iter() {
+            *counts.entry(s).or_insert(0) += 1;
+        }
+        assert_eq!(counts, dwfa.get_extension_candidates(baseline, other));
     }
 
     fn dwfa_config(wildcard: Option<u8>, allow_early_termination: bool, max_edit_distance: Option<usize>) -> DWFALiteConfig {

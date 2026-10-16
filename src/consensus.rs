@@ -33,7 +33,7 @@ use simple_error::{bail, SimpleError};
 use std::cmp::{Ordering, Reverse};
 
 use crate::cdwfa_config::{CdwfaConfig, ConsensusCost};
-use crate::dynamic_wfa::{DWFALite, DWFALiteState};
+use crate::dynamic_wfa::{DWFALite, DWFALiteState, ExtensionVotes};
 use crate::pqueue_tracker::PQueueTracker;
 use crate::priority_queue::{CachePriority, PriorityQueue};
 
@@ -619,21 +619,18 @@ impl ConsensusNode {
     /// * `baseline_sequences` - the sequences that are fixed that we want the consensus of
     /// * `wildcard` - an optional wildcard character, will be removed from return set unless it is the only value in it
     fn get_extension_candidates(&self, baseline_sequences: &[&[u8]], wildcard: Option<u8>) -> HashMap<u8, f64> {
-        let mut candidates: HashMap<u8, f64> = Default::default();
+        let mut votes = ExtensionVotes::default();
+        let mut symbols: Vec<u8> = Vec::with_capacity(16);
         for (baseline_seq, opt_dwfa) in baseline_sequences.iter().zip(self.dwfas.iter()) {
             if let Some(dwfa) = opt_dwfa.as_ref() {
-                // get the candidates and the total observation weight
-                let cand = dwfa.get_extension_candidates(baseline_seq, &self.consensus);
-                let vote_split = cand.values().sum::<usize>() as f64;
-                
-                // iterate over each candidate and scale it by the occurrences count / total weight
-                for (&c, &occ) in cand.iter() {
-                    let entry = candidates.entry(c).or_insert(0.0);
-                    *entry += occ as f64 / vote_split;
-                }
+                // each DWFA splits one vote over the symbols it nominates
+                symbols.clear();
+                dwfa.extension_symbols(baseline_seq, &self.consensus, &mut symbols);
+                votes.add(&symbols, 1.0);
             }
         }
 
+        let mut candidates = votes.into_map();
         if let Some(wc) = wildcard {
             if candidates.len() > 1 {
                 // we have 2+ candidates, we can safely remove the wildcard and have something left over

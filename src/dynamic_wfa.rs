@@ -151,7 +151,7 @@ impl DWFALite {
         };
 
         // maximally extend the diagonals at the frontier; the others cannot move
-        self.extend(baseline_seq, other_seq, false);
+        self.extend(baseline_seq, other_seq);
         
         // check how it looks
         let mut maximum_distance = self.maximum_other_distance();
@@ -182,8 +182,7 @@ impl DWFALite {
     /// # Arguments
     /// * `baseline_seq` - the baseline sequence, theoretically fixed
     /// * `other_seq` - the other sequence, typically getting updates
-    /// * `all_diagonals` - if false, only diagonals at the last extended length of `other_seq` are visited
-    fn extend(&mut self, baseline_seq: &[u8], other_seq: &[u8], all_diagonals: bool) {
+    fn extend(&mut self, baseline_seq: &[u8], other_seq: &[u8]) {
         // `i` is the index in the wavefront
         // `i // 2` is always the middle diagonal
         // anything less than that has used more baseline symbols
@@ -203,7 +202,7 @@ impl DWFALite {
 
         match self.frontier {
             // a shorter `other_seq` breaks the append-only contract, so that takes the full path below
-            Some(mut bits) if !all_diagonals && other_len >= self.extended_len => {
+            Some(mut bits) if other_len >= self.extended_len => {
                 // only the frontier diagonals can move; values only grow, so the cached maxima stay valid lower bounds
                 let mut new_bits: u128 = 0;
                 while bits != 0 {
@@ -220,7 +219,7 @@ impl DWFALite {
                 self.frontier = Some(new_bits);
             },
             _ => {
-                let frontier = if all_diagonals || other_len < self.extended_len { 0 } else { self.extended_len };
+                let frontier = if other_len < self.extended_len { 0 } else { self.extended_len };
                 let mut max_wavefront = 0;
                 let mut max_baseline = 0;
                 let mut new_bits: u128 = 0;
@@ -243,7 +242,7 @@ impl DWFALite {
     }
 
     /// This will increase the edit distance for this DWFA and create a new larger wavefront.
-    /// This function will automatically call `extend()` to enforce the assumptions.
+    /// It also extends each new diagonal and refreshes the cached maxima, as `extend()` does.
     /// # Arguments
     /// * `baseline_seq` - the baseline sequence, theoretically fixed
     /// * `other_seq` - the other sequence, typically getting updates
@@ -263,27 +262,18 @@ impl DWFALite {
         // first, increase the distance we're at
         self.edit_distance += 1;
 
-        // create an empty new wavefront
-        let new_wf_len = self.wavefront.len() + 2;
-        let mut new_wavefront: Vec<usize> = vec![0; new_wf_len];
-
-        // now we need to populate the wavefront
-        for (i, &d) in self.wavefront.iter().enumerate() {
-            // deletion (skipping) of a base in `baseline_seq`; this does not change the distance into `other_seq`
-            new_wavefront[i] = new_wavefront[i].max(d);
-
-            // mismatch progresses both sequences
-            new_wavefront[i+1] = new_wavefront[i+1].max(d + 1);
-
-            // insertion of a base into `baseline_seq`; this progresses `other_seq`
-            new_wavefront[i+2] = new_wavefront[i+2].max(d + 1);
-        }
-
-        // finally, save the new wavefront
-        self.wavefront = new_wavefront;
-
-        // re-extend; the new entries sit at positions that were never compared, so visit them all
-        self.extend(baseline_seq, other_seq, true);
+        // grow and re-extend; the bitmask only pays off for narrow wavefronts, so wide ones skip that work
+        let (edit_distance, offset, wildcard) = (self.edit_distance, self.offset, self.config.wildcard);
+        let tracked = self.wavefront.len() + 2 <= FRONTIER_BITS;
+        let grown = if tracked {
+            grow_narrow_wavefront(&mut self.wavefront, WavefrontGrower::new(baseline_seq, other_seq, edit_distance, offset, wildcard))
+        } else {
+            grow_wide_wavefront(&mut self.wavefront, WavefrontGrower::new(baseline_seq, other_seq, edit_distance, offset, wildcard))
+        };
+        self.max_wavefront = grown.max_wavefront;
+        self.max_baseline = grown.max_baseline;
+        self.frontier = tracked.then_some(grown.frontier);
+        self.extended_len = other_seq.len();
         Ok(())
     }
 
@@ -471,6 +461,113 @@ impl ExtensionVotes {
     }
 }
 
+/// The cached values after a wavefront grows.
+struct GrownWavefront {
+    max_wavefront: usize,
+    max_baseline: usize,
+    /// Bit `i` is set when diagonal `i` is at the end of `other_seq`. Only filled when the frontier is tracked.
+    frontier: u128,
+}
+
+// Grows a wavefront by two diagonals for an edit distance that is one larger, then extends each diagonal.
+// Each new diagonal sits at a position that was never compared, so all of them are visited.
+// Each new value is the maximum of up to three old values:
+// * deletion (skipping) of a base in `baseline_seq` from diagonal `i`; this does not change the distance into `other_seq`
+// * mismatch from diagonal `i - 1`; this progresses both sequences
+// * insertion of a base into `baseline_seq` from diagonal `i - 2`; this progresses `other_seq`
+// Diagonal 0 has only a deletion, diagonal 1 has no insertion, and the two new diagonals at the end have no deletion.
+// There are two versions with the same result:
+// * `grow_narrow_wavefront()` writes a new allocation of the exact size. Narrow wavefronts are mostly clones
+//   without spare capacity, and for those a new allocation is faster than a reallocation.
+// * `grow_wide_wavefront()` grows the wavefront in place. Wide wavefronts mostly belong to one DWFA that grows
+//   many times, e.g., in `finalize()`, so the amortized growth of the `Vec` saves an allocation for most steps.
+
+/// Grows a wavefront into a new allocation and fills `GrownWavefront::frontier`.
+/// The new wavefront must not be wider than `FRONTIER_BITS`.
+#[inline(always)]
+fn grow_narrow_wavefront(wavefront: &mut Vec<usize>, mut grower: WavefrontGrower<'_, true>) -> GrownWavefront {
+    let old = &wavefront[..];
+    let old_len = old.len();
+    debug_assert!(old_len > 0 && old_len + 2 <= FRONTIER_BITS);
+    let mut new_wavefront: Vec<usize> = Vec::with_capacity(old_len + 2);
+    new_wavefront.push(grower.visit(0, old[0]));
+    if old_len >= 2 {
+        new_wavefront.push(grower.visit(1, old[1].max(old[0] + 1)));
+        for (i, w) in (2..).zip(old.windows(3)) {
+            new_wavefront.push(grower.visit(i, w[2].max(w[1] + 1).max(w[0] + 1)));
+        }
+    }
+    let insertion = if old_len >= 2 { old[old_len - 2] + 1 } else { 0 };
+    new_wavefront.push(grower.visit(old_len, (old[old_len - 1] + 1).max(insertion)));
+    new_wavefront.push(grower.visit(old_len + 1, old[old_len - 1] + 1));
+    *wavefront = new_wavefront;
+    grower.grown
+}
+
+/// Grows a wavefront in place. It is filled from the end, so that `wavefront[i - 2..=i]` still holds the old values
+/// when diagonal `i` is computed.
+#[inline(always)]
+fn grow_wide_wavefront(wavefront: &mut Vec<usize>, mut grower: WavefrontGrower<'_, false>) -> GrownWavefront {
+    let old_len = wavefront.len();
+    debug_assert!(old_len > 0);
+    wavefront.resize(old_len + 2, 0);
+    let wavefront = &mut wavefront[..old_len + 2];
+    wavefront[old_len + 1] = grower.visit(old_len + 1, wavefront[old_len - 1] + 1);
+    let insertion = if old_len >= 2 { wavefront[old_len - 2] + 1 } else { 0 };
+    wavefront[old_len] = grower.visit(old_len, (wavefront[old_len - 1] + 1).max(insertion));
+    if old_len >= 2 {
+        // the old values of `i` and `i - 1` carry over from the last step
+        let mut deletion = wavefront[old_len - 1];
+        let mut mismatch = wavefront[old_len - 2];
+        for i in (2..old_len).rev() {
+            let insertion = wavefront[i - 2];
+            wavefront[i] = grower.visit(i, deletion.max(mismatch + 1).max(insertion + 1));
+            deletion = mismatch;
+            mismatch = insertion;
+        }
+        wavefront[1] = grower.visit(1, wavefront[1].max(wavefront[0] + 1));
+    }
+    wavefront[0] = grower.visit(0, wavefront[0]);
+    grower.grown
+}
+
+/// The inputs that each diagonal needs while a wavefront grows. A method, unlike a closure, can be forced inline.
+/// `TRACK_FRONTIER` fills `GrownWavefront::frontier`.
+struct WavefrontGrower<'a, const TRACK_FRONTIER: bool> {
+    baseline_seq: &'a [u8],
+    other_seq: &'a [u8],
+    edit_distance: usize,
+    offset: usize,
+    wildcard: Option<u8>,
+    grown: GrownWavefront,
+}
+
+impl<'a, const TRACK_FRONTIER: bool> WavefrontGrower<'a, TRACK_FRONTIER> {
+    #[inline(always)]
+    fn new(baseline_seq: &'a [u8], other_seq: &'a [u8], edit_distance: usize, offset: usize, wildcard: Option<u8>) -> Self {
+        WavefrontGrower {
+            baseline_seq,
+            other_seq,
+            edit_distance,
+            offset,
+            wildcard,
+            grown: GrownWavefront { max_wavefront: 0, max_baseline: 0, frontier: 0 },
+        }
+    }
+
+    /// Extends diagonal `i` from `d`, updates the cached values, and returns the extended `d`.
+    #[inline(always)]
+    fn visit(&mut self, i: usize, d: usize) -> usize {
+        let d = d + match_length(self.baseline_seq, self.other_seq, d + self.edit_distance - i, d + self.offset, self.wildcard);
+        if TRACK_FRONTIER && d + self.offset == self.other_seq.len() {
+            self.grown.frontier |= 1 << i;
+        }
+        self.grown.max_wavefront = self.grown.max_wavefront.max(d);
+        self.grown.max_baseline = self.grown.max_baseline.max(d + self.edit_distance - i);
+        d
+    }
+}
+
 /// Returns how many symbols match from `baseline_seq[baseline_offset..]` and `other_seq[other_offset..]`.
 /// A baseline symbol equal to `wildcard` matches anything.
 #[inline]
@@ -589,6 +686,86 @@ mod tests {
         }
         // make sure the wide-wavefront fallback was exercised
         assert!(2 * max_seen + 1 > FRONTIER_BITS);
+    }
+
+    /// The wavefront algorithm before the frontier and growth changes: grow by scattering into a zeroed wavefront,
+    /// then extend every diagonal one symbol at a time.
+    fn reference_wavefront(baseline: &[u8], other: &[u8], wildcard: Option<u8>) -> (usize, Vec<usize>, usize) {
+        let extend = |wavefront: &mut Vec<usize>, ed: usize| {
+            for (i, d) in wavefront.iter_mut().enumerate() {
+                while *d + ed - i < baseline.len() && *d < other.len() &&
+                    (baseline[*d + ed - i] == other[*d] || wildcard == Some(baseline[*d + ed - i])) {
+                    *d += 1;
+                }
+            }
+        };
+        let grow = |wavefront: &mut Vec<usize>| {
+            let mut new_wavefront = vec![0; wavefront.len() + 2];
+            for (i, &d) in wavefront.iter().enumerate() {
+                new_wavefront[i] = new_wavefront[i].max(d);
+                new_wavefront[i + 1] = new_wavefront[i + 1].max(d + 1);
+                new_wavefront[i + 2] = new_wavefront[i + 2].max(d + 1);
+            }
+            *wavefront = new_wavefront;
+        };
+        let max_baseline = |wavefront: &[usize], ed: usize| wavefront.iter().enumerate().map(|(i, &d)| d + ed - i).max().unwrap();
+
+        let (mut ed, mut wavefront) = (0, vec![0]);
+        extend(&mut wavefront, ed);
+        while *wavefront.iter().max().unwrap() < other.len() {
+            ed += 1;
+            grow(&mut wavefront);
+            extend(&mut wavefront, ed);
+        }
+        let update_ed = ed;
+        while max_baseline(&wavefront, ed) < baseline.len() {
+            ed += 1;
+            grow(&mut wavefront);
+            extend(&mut wavefront, ed);
+        }
+        (update_ed, wavefront, ed)
+    }
+
+    /// Like the `finalize` benchmark: `other` is `baseline` without one stretch, with a few errors.
+    /// Large gaps give wide wavefronts. The whole `other` is pushed at once, then `finalize` adds the gap.
+    #[test]
+    fn test_gapped_pairs_against_reference() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(13);
+        let mut max_seen = 0;
+        for trial in 0..60 {
+            let wildcard = if trial % 4 == 0 { Some(b'*') } else { None };
+            let alphabet: &[u8] = if wildcard.is_some() { b"ACGT*" } else { b"ACGT" };
+            let len = rng.gen_range(2..600);
+            let baseline: Vec<u8> = (0..len).map(|_| alphabet[rng.gen_range(0..alphabet.len())]).collect();
+            let gap = rng.gen_range(1..len);
+            let start = rng.gen_range(0..=len - gap);
+            let mut other: Vec<u8> = baseline[..start].iter().chain(baseline[start + gap..].iter()).cloned().collect();
+            for symbol in other.iter_mut() {
+                if rng.gen_range(0..50) == 0 {
+                    *symbol = b"ACGT"[rng.gen_range(0..4)];
+                }
+            }
+            if other.is_empty() {
+                other.push(b'A');
+            }
+            // also swap the roles, so that `other` is the longer sequence
+            let (baseline, other) = if trial % 2 == 0 { (baseline, other) } else { (other, baseline) };
+
+            let (expected_update, expected_wavefront, expected_final) = reference_wavefront(&baseline, &other, wildcard);
+            let table = reference_table(&baseline, &other, wildcard);
+            assert_eq!(expected_update, (0..=baseline.len()).map(|k| table[k][other.len()]).min().unwrap(), "trial {trial}");
+
+            let mut dwfa = DWFALite::new(dwfa_config(wildcard, false, None));
+            assert_eq!(dwfa.update(&baseline, &other).unwrap(), expected_update, "trial {trial}, update");
+            dwfa.finalize(&baseline, &other).unwrap();
+            assert_eq!(dwfa.edit_distance(), expected_final, "trial {trial}, finalized");
+            assert_eq!(dwfa.wavefront(), &expected_wavefront[..], "trial {trial}, wavefront");
+            assert_eq!(dwfa.maximum_other_distance(), *expected_wavefront.iter().max().unwrap(), "trial {trial}");
+            max_seen = max_seen.max(dwfa.edit_distance());
+        }
+        // make sure that both the narrow and the wide growth were exercised
+        assert!(2 * max_seen + 1 > 4 * FRONTIER_BITS);
     }
 
     #[test]

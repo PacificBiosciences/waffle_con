@@ -74,6 +74,12 @@ pub fn generate_dual_test(
 }
 
 /// Samples noisy reads from one consensus using mismatch, deletion, and insertion at equal rates.
+/// # Arguments
+/// * `rng` - the random number generator to use
+/// * `consensus` - the sequence to sample reads from
+/// * `alphabet_size` - the length of the alphabet, e.g. for DNA it's 4
+/// * `num_samples` - the number of reads to generate
+/// * `error_rate` - per-base mismatch, insertion, and deletion rate applied independently to each read
 fn sample_reads<R: Rng>(
     rng: &mut R,
     consensus: &[u8],

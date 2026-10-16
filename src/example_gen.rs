@@ -73,6 +73,48 @@ pub fn generate_dual_test(
     (allele1, allele2, reads)
 }
 
+/// Builds one random baseline and a second sequence derived from it.
+/// The derived sequence removes a centered stretch of `gap_len` bases, then adds the usual per-base errors.
+/// # Arguments
+/// * `alphabet_size` - the length of the alphabet, e.g. for DNA it's 4
+/// * `seq_len` - the length of the baseline
+/// * `error_rate` - per-base mismatch, insertion, and deletion rate applied to the derived sequence
+/// * `gap_len` - how many baseline bases are removed from the middle before errors are applied
+/// # Returns
+/// The baseline and the derived sequence.
+pub fn generate_finalize_pair(
+    alphabet_size: u8,
+    seq_len: usize,
+    error_rate: f64,
+    gap_len: usize,
+) -> (Vec<u8>, Vec<u8>) {
+    // sanity checks
+    assert!(alphabet_size > 1);
+    assert!(seq_len > 0);
+    assert!((0.0..=1.0).contains(&error_rate));
+    assert!(gap_len > 0 && gap_len < seq_len);
+
+    // generate the baseline
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0);
+    let base_distribution = Uniform::new(0, alphabet_size);
+    let baseline: Vec<u8> = (0..seq_len)
+        .map(|_i| rng.sample(base_distribution))
+        .collect();
+
+    // Drop a centered stretch so the gap is neither a prefix nor a suffix.
+    let gap_start = (seq_len - gap_len) / 2;
+    let mut without_gap = Vec::with_capacity(seq_len - gap_len);
+    without_gap.extend_from_slice(&baseline[..gap_start]);
+    without_gap.extend_from_slice(&baseline[gap_start + gap_len..]);
+
+    // now add random errors to the gapped sequence
+    let other = sample_reads(&mut rng, &without_gap, alphabet_size, 1, error_rate)
+        .pop()
+        .unwrap();
+
+    (baseline, other)
+}
+
 /// Samples noisy reads from one consensus using mismatch, deletion, and insertion at equal rates.
 /// # Arguments
 /// * `rng` - the random number generator to use
@@ -155,5 +197,24 @@ mod tests {
         let first = generate_dual_test(4, 40, 4, 0.02, 2);
         let second = generate_dual_test(4, 40, 4, 0.02, 2);
         assert_eq!(first, second);
+    }
+
+    /// A zero-error pair is the baseline with a centered stretch removed.
+    #[test]
+    fn finalize_pair_drops_a_centered_gap() {
+        let (baseline, other) = generate_finalize_pair(4, 100, 0.0, 20);
+        assert_eq!(baseline.len(), 100);
+        assert_eq!(other.len(), 80);
+        assert_eq!(&other[..40], &baseline[..40]);
+        assert_eq!(&other[40..], &baseline[60..]);
+    }
+
+    /// Noisy pairs stay in the alphabet and do not change between calls.
+    #[test]
+    fn finalize_pair_is_deterministic() {
+        let first = generate_finalize_pair(4, 80, 0.01, 10);
+        let second = generate_finalize_pair(4, 80, 0.01, 10);
+        assert_eq!(first, second);
+        assert!(first.0.iter().chain(first.1.iter()).all(|&base| base < 4));
     }
 }

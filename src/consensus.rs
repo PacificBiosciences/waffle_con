@@ -23,20 +23,31 @@ let consensuses = cdwfa.consensus().unwrap();
 assert_eq!(consensuses.len(), 1);
 assert_eq!(consensuses[0].sequence(), sequences[1]);
 assert_eq!(consensuses[0].scores(), &[1, 0, 1]);
+assert_eq!(consensuses[0].assignments(), None);
 ```
 */
 
 use log::{debug, trace};
-use priority_queue::PriorityQueue;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use simple_error::bail;
-use std::cmp::Reverse;
+use simple_error::{bail, SimpleError};
+use std::cmp::{Ordering, Reverse};
 
 use crate::cdwfa_config::{CdwfaConfig, ConsensusCost};
-use crate::dynamic_wfa::DWFALite;
+use crate::dynamic_wfa::{DWFALite, DWFALiteState};
 use crate::pqueue_tracker::PQueueTracker;
+use crate::priority_queue::{CachePriority, PriorityQueue};
 
-type NodePriority = (Reverse<usize>, usize);
+/// Lower cost, then longer consensus, then an earlier tie-breaker.
+type NodePriority = (Reverse<usize>, usize, Reverse<u64>);
+
+/// Whether a read in a single consensus was used or halted at the edit-distance cap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConsensusAssignment {
+    /// The read was tracked through the consensus.
+    Included,
+    /// The read stopped contributing because it reached the edit-distance cap.
+    EditDistanceLimit,
+}
 
 /// Contains a final consensus result
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -46,17 +57,33 @@ pub struct Consensus {
     /// The consensus scoring model
     consensus_cost: ConsensusCost,
     /// Vector of the scores from the consensus to each sequence
-    scores: Vec<usize>
+    scores: Vec<usize>,
+    /// Per-read assignment. `None` when every score belongs to an included read.
+    /// `Some` when any read was halted at the edit-distance cap; the vector matches `scores`.
+    assignments: Option<Vec<ConsensusAssignment>>,
 }
 
 impl Consensus {
     /// Constructor
-    pub fn new(sequence: Vec<u8>, consensus_cost: ConsensusCost, scores: Vec<usize>) -> Consensus {
-        Consensus {
+    /// # Errors
+    /// * if `assignments` is `Some` and its length does not match `scores`
+    pub fn new(
+        sequence: Vec<u8>,
+        consensus_cost: ConsensusCost,
+        scores: Vec<usize>,
+        assignments: Option<Vec<ConsensusAssignment>>,
+    ) -> Result<Consensus, SimpleError> {
+        if let Some(assignments) = &assignments {
+            if assignments.len() != scores.len() {
+                bail!("assignments and scores must have the same length");
+            }
+        }
+        Ok(Consensus {
             sequence,
             consensus_cost,
-            scores
-        }
+            scores,
+            assignments,
+        })
     }
 
     // Getters
@@ -70,6 +97,11 @@ impl Consensus {
 
     pub fn scores(&self) -> &[usize] {
         &self.scores
+    }
+
+    /// Per-read assignment. `None` when every score belongs to an included read.
+    pub fn assignments(&self) -> Option<&[ConsensusAssignment]> {
+        self.assignments.as_deref()
     }
 }
 
@@ -210,13 +242,12 @@ impl<'a> ConsensusDWFA<'a> {
         let initial_size = self.sequences.iter().map(|s| s.len()).max().unwrap();
         let mut pqueue_tracker = PQueueTracker::with_capacity(initial_size, max_capacity_per_size);
 
-        let initial_node = ConsensusNode::new_root_node(&offsets, self.config.wildcard, self.config.allow_early_termination)?;
-        let initial_priority = initial_node.priority(self.consensus_cost());
-        
-        // start the priority queue, which defaults to bigger is better so we need a Reverse since want smaller costs
-        let mut pqueue: PriorityQueue<ConsensusNode, NodePriority> = PriorityQueue::new();
+        let initial_node = ConsensusNode::new_root_node(&self.sequences, &offsets, &self.config)?;
+
+        // Max-heap ordered by queued priority: lower cost, then longer consensus, then earlier tie-breaker.
+        let mut pqueue = PriorityQueue::new(self.consensus_cost());
         pqueue_tracker.insert(initial_node.consensus().len());
-        pqueue.push(initial_node, initial_priority);
+        pqueue.push(initial_node);
 
         let mut ret = vec![];
 
@@ -232,7 +263,8 @@ impl<'a> ConsensusDWFA<'a> {
             }
 
             // get the top node and check if it's bad
-            let (top_node, top_priority) = pqueue.pop().unwrap();
+            let top_node = pqueue.pop().unwrap();
+            let top_priority = top_node.queued_priority();
             let top_len = top_node.consensus().len();
             pqueue_tracker.remove(top_len);
 
@@ -273,8 +305,9 @@ impl<'a> ConsensusDWFA<'a> {
                     ret.push(Consensus::new(
                         finalized_node.consensus().to_vec(),
                         self.config.consensus_cost,
-                        finalized_node.costs(self.config.consensus_cost)
-                    ));
+                        finalized_node.costs(self.config.consensus_cost),
+                        finalized_node.assignments(),
+                    )?);
                 }
             }
 
@@ -327,15 +360,14 @@ impl<'a> ConsensusDWFA<'a> {
                 if let Some(activate_list) = opt_activate_list {
                     assert!(!activate_list.is_empty());
                     for &seq_index in activate_list.iter() {
-                        new_node.activate_sequence(self.sequences[seq_index], seq_index, offset_window, offset_compare_length, self.config.wildcard, self.config.allow_early_termination)?;
+                        new_node.activate_sequence(self.sequences[seq_index], seq_index, offset_window, offset_compare_length, &self.config)?;
                     }
                 }
 
                 // get the new cost and put it in the queue
-                let new_priority = new_node.priority(self.consensus_cost());
-                trace!("\tPush {:?} => {:?}", new_priority, new_node.consensus);
+                trace!("\tPush {} => {:?}", pqueue.next_id(), new_node.consensus);
                 pqueue_tracker.insert(new_node.consensus().len());
-                pqueue.push(new_node, new_priority);
+                pqueue.push(new_node);
             }
         }
 
@@ -364,32 +396,64 @@ impl<'a> ConsensusDWFA<'a> {
     }
 }
 
-/// Wrapper for a node containing a partial consensus as well as the DWFA tracking for that node
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+/// Wrapper for a node containing a partial consensus as well as the DWFA tracking for that node.
+#[derive(Clone, Debug, Eq)]
 struct ConsensusNode {
     /// The consensus sequence so far
     consensus: Vec<u8>,
     /// The DWFAs that are tracked for each sequence; these are only None if they have not been activated yet due to an offset
-    dwfas: Vec<Option<DWFALite>>
+    dwfas: Vec<Option<DWFALite>>,
+    /// Rank in the search heap: lower cost, then longer consensus, then earlier tie-breaker. Set by `cache_priority`.
+    queued_priority: NodePriority,
+}
+
+// The following Eq and Ord implementations are specifically for the Binary Heap.
+// They should not be used for actual node comparison.
+
+impl PartialEq for ConsensusNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.queued_priority == other.queued_priority
+    }
+}
+
+impl PartialOrd for ConsensusNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ConsensusNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap pops the greatest node. queued_priority already ranks a lower edit distance,
+        // then a longer consensus, then an earlier tie-breaker.
+        self.queued_priority.cmp(&other.queued_priority)
+    }
 }
 
 impl ConsensusNode {
     /// Constructor for a new consensus search root node
     /// # Arguments
+    /// * `sequences` - the baseline reads, parallel to `offsets`
     /// * `offsets` - a set of offsets into the sequences where the approximate starts are
-    /// * `wildcard` - an optional wildcard symbol that will match anything
-    /// * `allow_early_termination` - if true, then it will allow the consensus to go beyond the provided baseline sequences without penalty
+    /// * `config` - consensus configuration
     /// # Errors
     /// * if DWFA construction fails
-    fn new_root_node(offsets: &[Option<usize>], wildcard: Option<u8>, allow_early_termination: bool) -> Result<ConsensusNode, Box<dyn std::error::Error>> {
-        let dwfas: Vec<Option<DWFALite>> = offsets.iter()
-            .map(|offset| match offset {
+    /// * if `sequences` and `offsets` have different lengths
+    fn new_root_node(sequences: &[&[u8]], offsets: &[Option<usize>], config: &CdwfaConfig) -> Result<ConsensusNode, Box<dyn std::error::Error>> {
+        if sequences.len() != offsets.len() {
+            bail!("Sequence and offset counts must match.");
+        }
+        let mut dwfas = Vec::with_capacity(offsets.len());
+        for (sequence, offset) in sequences.iter().zip(offsets.iter()) {
+            let dwfa = if offset.is_some() {
                 // we have an offset, so do not create a map
-                Some(_o) => None,
-                // we don't have an offset, so this is active from the start
-                None => Some(DWFALite::new(wildcard, allow_early_termination))
-            })
-            .collect();
+                None
+            } else {
+                // active from the start; cap is fixed from this read's length
+                Some(DWFALite::new(config.dwfa_lite_config_for(sequence.len())?))
+            };
+            dwfas.push(dwfa);
+        }
 
         let active_count = dwfas.iter().filter(|d| d.is_some()).count();
         if active_count == 0 {
@@ -398,7 +462,8 @@ impl ConsensusNode {
 
         Ok(ConsensusNode {
             consensus: vec![],
-            dwfas
+            dwfas,
+            queued_priority: (Reverse(0), 0, Reverse(0)),
         })
     }
 
@@ -408,9 +473,8 @@ impl ConsensusNode {
     /// * `seq_index` - the sequence index, which will map to the DWFAs
     /// * `offset_window` - the window we are searching for a best match
     /// * `offset_compare_length` - the amount of bases we are comparing
-    /// * `wildcard` - optional wildcard for scoring, passed into DWFA
-    /// * `allow_early_termination` - enables sequences to end partway through the consensus, passed into DWFA
-    fn activate_sequence(&mut self, sequence: &[u8], seq_index: usize, offset_window: usize, offset_compare_length: usize, wildcard: Option<u8>, allow_early_termination: bool) -> Result<(), Box<dyn std::error::Error>> {
+    /// * `config` - consensus configuration, including wildcard, early termination, and the edit-distance cap
+    fn activate_sequence(&mut self, sequence: &[u8], seq_index: usize, offset_window: usize, offset_compare_length: usize, config: &CdwfaConfig) -> Result<(), Box<dyn std::error::Error>> {
         // make sure everything is currently inactive
         assert!(self.dwfas[seq_index].is_none());
 
@@ -427,19 +491,19 @@ impl ConsensusNode {
 
         // figure out which offset has the best score; assume the middle of the offset window is the best
         let mut best_offset = con_len.saturating_sub(offset_compare_length + offset_window / 2);
-        let mut min_ed = crate::sequence_alignment::wfa_ed_config(&self.consensus[best_offset..], &sequence[0..offset_compare_length], false, wildcard);
+        let mut min_ed = crate::sequence_alignment::wfa_ed_config(&self.consensus[best_offset..], &sequence[0..offset_compare_length], false, config.wildcard);
         
         // now check all the rest around this position
         for p in start_position..end_position {
-            let ed = crate::sequence_alignment::wfa_ed_config(&self.consensus[p..], &sequence[0..offset_compare_length], false, wildcard);
+            let ed = crate::sequence_alignment::wfa_ed_config(&self.consensus[p..], &sequence[0..offset_compare_length], false, config.wildcard);
             if ed < min_ed {
                 min_ed = ed;
                 best_offset = p;
             }
         }
 
-        // now set up the DWFA with the best offset
-        let mut new_dwfa = DWFALite::new(wildcard, allow_early_termination);
+        // now set up the DWFA with the best offset and a cap from this read's length
+        let mut new_dwfa = DWFALite::new(config.dwfa_lite_config_for(sequence.len())?);
         new_dwfa.set_offset(best_offset);
         new_dwfa.update(sequence, &self.consensus)?;
         self.dwfas[seq_index] = Some(new_dwfa);
@@ -493,20 +557,31 @@ impl ConsensusNode {
             .collect()
     }
 
+    /// Labels each read. `None` when every read was used.
+    /// `Some` when any read was not Included.
+    fn assignments(&self) -> Option<Vec<ConsensusAssignment>> {
+        let labels: Vec<ConsensusAssignment> = self.dwfas.iter()
+            .map(|opt_dwfa| {
+                if opt_dwfa.as_ref().is_some_and(|dwfa| dwfa.state() == DWFALiteState::ExceededEditDistanceLimit) {
+                    ConsensusAssignment::EditDistanceLimit
+                } else {
+                    ConsensusAssignment::Included
+                }
+            })
+            .collect();
+
+        // if ALL labels are included, then we can safely send back None
+        if labels.iter().all(|label| *label == ConsensusAssignment::Included) {
+            None
+        } else {
+            // otherwise, we need to send back the labels
+            Some(labels)
+        }
+    }
+
     /// Returns the total score for the node
     fn total_cost(&self, consensus_cost: ConsensusCost) -> usize {
         self.costs(consensus_cost).iter().sum()
-    }
-
-    /// Returns the node priority.
-    /// Currently, this is based on 1) lowest cost and 2) consensus length.
-    /// # Arguments
-    /// * `consensus_cost` - cost model to evaluate the cost
-    fn priority(&self, consensus_cost: ConsensusCost) -> NodePriority {
-        (
-            Reverse(self.total_cost(consensus_cost)),
-            self.consensus.len()
-        )
     }
 
     /// Returns true if any of the dwfas are at the end of their respective baseline sequences
@@ -517,7 +592,13 @@ impl ConsensusNode {
         let mut end_iter = baseline_sequences.iter().zip(self.dwfas.iter())
             .map(|(&baseline, opt_dwfa)| {
                 if let Some(dwfa) = opt_dwfa.as_ref() {
-                    dwfa.reached_baseline_end(baseline)
+                    if dwfa.state() == DWFALiteState::ExceededEditDistanceLimit {
+                        // A capped read must not finish the consensus early, and must not block when every read has to finish.
+                        // So by returning the require_all value, we silently skip this read in either case.
+                        require_all
+                    } else {
+                        dwfa.reached_baseline_end(baseline)
+                    }
                 } else {
                     false
                 }
@@ -567,13 +648,53 @@ impl ConsensusNode {
     fn consensus(&self) -> &[u8] {
         &self.consensus
     }
+
+    /// Rank cached for the search heap: lower cost, then longer consensus, then earlier tie-breaker.
+    fn queued_priority(&self) -> NodePriority {
+        self.queued_priority
+    }
+}
+
+impl CachePriority for ConsensusNode {
+    /// Caches this node's search priority.
+    /// Rank is 1) lowest cost, 2) consensus length, and 3) earlier tie-breaker.
+    fn cache_priority(&mut self, consensus_cost: ConsensusCost, tie_breaker: u64) {
+        self.queued_priority = (
+            Reverse(self.total_cost(consensus_cost)),
+            self.consensus.len(),
+            Reverse(tie_breaker),
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BinaryHeap;
 
     use crate::cdwfa_config::CdwfaConfigBuilder;
+
+    #[test]
+    fn test_heap_orders_by_priority_then_id() {
+        let sequences: [&[u8]; 1] = [b""];
+        let offsets = vec![None];
+        let config = CdwfaConfig::default();
+        let mut earlier = ConsensusNode::new_root_node(&sequences, &offsets, &config).unwrap();
+        let mut later = ConsensusNode::new_root_node(&sequences, &offsets, &config).unwrap();
+        let mut cheaper = ConsensusNode::new_root_node(&sequences, &offsets, &config).unwrap();
+        earlier.queued_priority = (Reverse(1), 0, Reverse(0));
+        later.queued_priority = (Reverse(1), 0, Reverse(1));
+        cheaper.queued_priority = (Reverse(0), 0, Reverse(2));
+
+        let mut heap = BinaryHeap::new();
+        heap.push(later);
+        heap.push(earlier);
+        heap.push(cheaper);
+
+        assert_eq!(heap.pop().unwrap().queued_priority().2.0, 2);
+        assert_eq!(heap.pop().unwrap().queued_priority().2.0, 0);
+        assert_eq!(heap.pop().unwrap().queued_priority().2.0, 1);
+    }
 
     #[test]
     fn test_single_sequence() {
@@ -589,7 +710,8 @@ mod tests {
         assert_eq!(consensus, vec![Consensus {
             sequence: sequence.to_vec(),
             consensus_cost: ConsensusCost::L1Distance,
-            scores: vec![0]
+            scores: vec![0],
+            assignments: None,
         }]);
     }
 
@@ -612,12 +734,14 @@ mod tests {
             Consensus {
                 sequence: sequence2.to_vec(),
                 consensus_cost: ConsensusCost::L1Distance,
-                scores: vec![1, 0]
+                scores: vec![1, 0],
+                assignments: None,
             },
             Consensus {
                 sequence: sequence.to_vec(),
                 consensus_cost: ConsensusCost::L1Distance,
-                scores: vec![0, 1]
+                scores: vec![0, 1],
+                assignments: None,
             },
         ]);
     }
@@ -644,7 +768,8 @@ mod tests {
             Consensus {
                 sequence: sequence.to_vec(),
                 consensus_cost: ConsensusCost::L1Distance,
-                scores: vec![0, 0, 1]
+                scores: vec![0, 0, 1],
+                assignments: None,
             }
         ]);
     }
@@ -758,8 +883,8 @@ mod tests {
         // this first approach generated multiple possible ones that are in the middle
         let consensus = consensus_dwfa.consensus().unwrap();
         assert_eq!(consensus, [
-            Consensus { sequence: vec![65, 67], consensus_cost: ConsensusCost::L1Distance, scores: vec![1, 0, 1, 2] }, 
-            Consensus { sequence: vec![65, 67, 71], consensus_cost: ConsensusCost::L1Distance, scores: vec![2, 1, 0, 1] }
+            Consensus { sequence: vec![65, 67], consensus_cost: ConsensusCost::L1Distance, scores: vec![1, 0, 1, 2], assignments: None },
+            Consensus { sequence: vec![65, 67, 71], consensus_cost: ConsensusCost::L1Distance, scores: vec![2, 1, 0, 1], assignments: None }
         ]);
 
         // second, verify that allowing early termination fixes it to the original result
@@ -775,7 +900,7 @@ mod tests {
         // this first approach generated multiple possible ones that are in the middle
         let consensus = consensus_dwfa.consensus().unwrap();
         assert_eq!(consensus, [
-            Consensus { sequence: expected_consensus.to_vec(), consensus_cost: ConsensusCost::L1Distance, scores: vec![0; 4] },
+            Consensus { sequence: expected_consensus.to_vec(), consensus_cost: ConsensusCost::L1Distance, scores: vec![0; 4], assignments: None },
         ]);
     }
 
@@ -848,5 +973,31 @@ mod tests {
         assert!(consensus_err.is_err());
         let error = consensus_err.err().unwrap();
         assert_eq!(error.to_string(), "Finalize called on DWFA that was never initialized.");
+    }
+
+    #[test]
+    fn test_edit_distance_cap_ignores_outlier() {
+        let good = b"ACGTACGTACGT";
+        let bad = b"TTTTTTTTTTTT";
+        let mut consensus_dwfa = ConsensusDWFA::with_config(
+            CdwfaConfigBuilder::default()
+                .max_edit_distance(Some(3))
+                .build().unwrap()
+        ).unwrap();
+        consensus_dwfa.add_sequence(good).unwrap();
+        consensus_dwfa.add_sequence(good).unwrap();
+        consensus_dwfa.add_sequence(good).unwrap();
+        consensus_dwfa.add_sequence(bad).unwrap();
+
+        let consensus = consensus_dwfa.consensus().unwrap();
+        assert_eq!(consensus.len(), 1);
+        assert_eq!(consensus[0].sequence(), good);
+        assert_eq!(consensus[0].scores(), &[0, 0, 0, 3]);
+        assert_eq!(consensus[0].assignments(), Some(&[
+            ConsensusAssignment::Included,
+            ConsensusAssignment::Included,
+            ConsensusAssignment::Included,
+            ConsensusAssignment::EditDistanceLimit,
+        ][..]));
     }
 }

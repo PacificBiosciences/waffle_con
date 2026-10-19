@@ -3,13 +3,15 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 use waffle_con::cdwfa_config::CdwfaConfigBuilder;
 use waffle_con::consensus::ConsensusDWFA;
-use waffle_con::example_gen::generate_test;
+use waffle_con::dual_consensus::DualConsensusDWFA;
+use waffle_con::dynamic_wfa::{DWFALite, DWFALiteConfigBuilder};
+use waffle_con::example_gen::{generate_dual_test, generate_finalize_pair, generate_test};
 
 pub fn bench_consensus(c: &mut Criterion) {
     let alphabet_size = 4;
-    let seq_lens = [1000, 10000];
-    let num_samples = [8, 30];
-    let error_rates = [0.0, 0.01, 0.02];
+    let seq_lens = [50, 200, 1000];
+    let num_samples = [10, 30];
+    let error_rates = [0.0, 0.01];
 
     let mut benchmark_group = c.benchmark_group("consensus-group");
     benchmark_group.sample_size(10);
@@ -51,5 +53,75 @@ pub fn bench_consensus(c: &mut Criterion) {
     benchmark_group.finish();
 }
 
-criterion_group!(benches, bench_consensus);
+pub fn bench_dual_consensus(c: &mut Criterion) {
+    let alphabet_size = 4;
+    let seq_lens = [50, 200, 1000];
+    let num_samples = [10, 30];
+    let error_rates = [0.0, 0.01];
+
+    let mut benchmark_group = c.benchmark_group("dual-consensus-group");
+    benchmark_group.sample_size(10);
+
+    for &sl in seq_lens.iter() {
+        // About 2% of positions differ between the two true alleles, and at least one.
+        let num_differences = (sl / 50).max(1);
+        for &ns in num_samples.iter() {
+            // Require 25% of one allele's reads. Each allele contributes `ns` reads.
+            let config = CdwfaConfigBuilder::default()
+                .min_count((ns as u64) / 4)
+                .build().unwrap();
+            for &er in error_rates.iter() {
+                let (_allele1, _allele2, dataset) = generate_dual_test(alphabet_size, sl, ns, er, num_differences);
+                let test_label = format!("dual_{alphabet_size}x{sl}x{ns}_{er}_diff{num_differences}");
+                benchmark_group.bench_function(&test_label, |b| b.iter(|| {
+                    black_box({
+                        let mut consensus_dwfa = DualConsensusDWFA::with_config(config.clone()).unwrap();
+                        for s in dataset.iter() {
+                            consensus_dwfa.add_sequence(s).unwrap();
+                        }
+                        consensus_dwfa.consensus().unwrap()
+                    });
+                }));
+            }
+        }
+    }
+
+    benchmark_group.finish();
+}
+
+pub fn bench_finalize(c: &mut Criterion) {
+    let alphabet_size = 4;
+    // 4000 leaves 500 bases on either side of the largest gap.
+    let seq_lens = [4000];
+    let error_rate = 0.01;
+    let gap_lens = [1000, 2000, 3000];
+
+    let mut benchmark_group = c.benchmark_group("finalize-group");
+    benchmark_group.sample_size(10);
+
+    for &sl in seq_lens.iter() {
+        for &gap in gap_lens.iter() {
+            // The cap has to clear the gap. A fixed cap of 500 would stop the 1000, 2000, and 3000 cases at the same distance.
+            // A middle gap is closed while `other` is pushed; `finalize` then accounts for any baseline that is still unconsumed.
+            let config = DWFALiteConfigBuilder::default()
+                .max_edit_distance(Some(sl + gap))
+                .build()
+                .unwrap();
+            let (baseline, other) = generate_finalize_pair(alphabet_size, sl, error_rate, gap);
+            let test_label = format!("finalize_{alphabet_size}x{sl}_{error_rate}_gap{gap}");
+            benchmark_group.bench_function(&test_label, |b| b.iter(|| {
+                black_box({
+                    let mut dwfa = DWFALite::new(config.clone());
+                    dwfa.update(&baseline, &other).unwrap();
+                    dwfa.finalize(&baseline, &other).unwrap();
+                    dwfa.edit_distance()
+                });
+            }));
+        }
+    }
+
+    benchmark_group.finish();
+}
+
+criterion_group!(benches, bench_consensus, bench_dual_consensus, bench_finalize);
 criterion_main!(benches);

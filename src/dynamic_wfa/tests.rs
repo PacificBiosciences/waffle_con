@@ -152,6 +152,59 @@ fn test_required_finalize() {
 }
 
 #[test]
+fn test_finalize_global_endpoint() {
+    let mut dwfa = DWFALite::default();
+    assert_eq!(dwfa.update(b"AC", b"CA").unwrap(), 1);
+    dwfa.finalize(b"AC", b"CA").unwrap();
+    assert_eq!(dwfa.edit_distance(), 2);
+    assert_eq!(dwfa.state(), DWFALiteState::Finalized);
+}
+
+#[test]
+fn test_finalize_endpoint_modes_and_caps() {
+    // Each case: (baseline, other sequence after the offset, expected global distance, expected early-termination distance)
+    let cases: &[(&[u8], &[u8], usize, usize)] = &[
+        // Early mode skips the baseline's A and matches C, global mode also needs an edit for the trailing A in CA
+        (b"AC", b"CA", 2, 1),
+        // Early mode stops after AC, global mode needs two more edits for the extra TT
+        (b"AC", b"ACTT", 2, 0),
+        // Both modes must reach the baseline's end, so both need two edits for its unmatched TT
+        (b"ACTT", b"AC", 2, 2),
+        // An empty baseline is already finished in early mode, global mode needs two edits for AC
+        (b"", b"AC", 2, 0),
+        // The other sequence is empty, so both modes need two edits for the baseline's AC
+        (b"AC", b"", 2, 2),
+        // Both sequences are empty, so neither mode needs any edits
+        (b"", b"", 0, 0),
+    ];
+    // Run every sequence pair with all combinations of mode, edit cap, and starting offset
+    for &(baseline, suffix, global_distance, early_distance) in cases {
+        // Global mode must finish both sequences, early mode only needs to finish the baseline
+        for early in [false, true] {
+            let distance = if early { early_distance } else { global_distance };
+            // Try unlimited edits and caps below, at, or above the expected distance
+            for cap in [None, Some(0), Some(1), Some(2), Some(3)] {
+                // Skipping a two-byte prefix should give the same result as starting at position 0
+                for offset in [0, 2] {
+                    let mut other = vec![17; offset];
+                    other.extend_from_slice(suffix);
+                    let mut dwfa = DWFALite::new(dwfa_config(None, early, cap));
+                    dwfa.set_offset(offset);
+                    dwfa.update(baseline, &other).unwrap();
+                    dwfa.finalize(baseline, &other).unwrap();
+                    assert_eq!(dwfa.edit_distance(), cap.map_or(distance, |cap| distance.min(cap)),
+                        "{baseline:?}/{suffix:?}, early {early}, cap {cap:?}, offset {offset}");
+                    assert_eq!(dwfa.state(), if cap.is_some_and(|cap| distance > cap) {
+                        DWFALiteState::ExceededEditDistanceLimit
+                    } else { DWFALiteState::Finalized },
+                        "{baseline:?}/{suffix:?}, early {early}, cap {cap:?}, offset {offset}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn test_cloning() {
     let sequence     = b"AAAAAAA";
     let alt_sequence = b"AAACAAA";

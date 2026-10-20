@@ -16,6 +16,7 @@
 
 ## Tests and benchmarks
 * Add independent DP and scalar-wavefront coverage for endpoint modes, caps, offsets, wildcards, update chunking, narrow/wide boundaries, and clone isolation.
+* Add public single/dual consensus regressions for finalized scores, first-seen search limits, sibling alleles, split thresholds, capped assignments, and both per-read score arrays.
 
 ## Breaking changes
 * `Consensus::new` now takes per-read assignments and returns a `Result`

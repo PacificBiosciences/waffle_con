@@ -380,14 +380,19 @@ impl DWFALite {
         Ok(())
     }
 
-    /// Applies all remaining edits of `finalize()` at once. Call it only when no diagonal can extend again, i.e.,
-    /// each diagonal is at or past the end of `other_seq`. Then each edit raises both cached maxima by exactly one,
-    /// so the number of edits up to the baseline end or the cap is known, and `grow_without_matches()` has a closed
-    /// form for the wavefront. The result is the same as from that many calls of `increase_edit_distance()`.
+    /// Applies the remaining edits when every diagonal is at or past the end of `other_seq`.
+    /// Early mode needs the baseline end. Ordinary mode needs the terminal diagonal to become reachable;
+    /// the all-lanes guard guarantees that it has already consumed the other sequence once it exists.
+    /// Keep the full wavefront using the same closed-form growth as repeated individual edits.
     /// # Arguments
     /// * `baseline_len` - the length of the baseline sequence
-    fn finish_without_matches(&mut self, baseline_len: usize) {
-        let mut steps = baseline_len.saturating_sub(self.max_baseline);
+    /// * `other_len` - the length of the last sequence supplied to `update()`
+    fn finish_without_matches(&mut self, baseline_len: usize, other_len: usize) {
+        let mut steps = if self.config.allow_early_termination {
+            baseline_len.saturating_sub(self.max_baseline)
+        } else {
+            baseline_len.abs_diff(other_len - self.offset).saturating_sub(self.edit_distance)
+        };
         if let Some(limit) = self.config.max_edit_distance {
             steps = steps.min(limit.saturating_sub(self.edit_distance));
         }
@@ -398,18 +403,20 @@ impl DWFALite {
         self.edit_distance += steps;
         self.max_wavefront += steps;
         self.max_baseline += steps;
+        self.extended_len = other_len;
         // this only runs for wavefronts that are too wide for the frontier bitmask
         self.frontier = None;
     }
 
-    /// This function signals that base insertion into `other_seq` is completed.
-    /// This will trigger the algorithm to make sure we have reached the end of both the `baseline_seq`, potentially increasing edit distance further.
-    /// Note: other_seq should already be at the end UNLESS we allow_early_termination
+    /// Seals an alignment after the last update with these same sequences.
+    /// Ordinary mode reaches the joint terminal cell; early mode only requires the baseline end.
+    /// The baseline must remain unchanged, the other sequence must be append-only, and the offset
+    /// must not exceed its length. Call `update()` before finalizing, including for empty sequences.
     /// # Arguments
-    /// * `baseline_seq` - the baseline sequence, theoretically fixed
-    /// * `other_seq` - the other sequence, typically getting updates
+    /// * `baseline_seq` - the unchanged baseline sequence
+    /// * `other_seq` - the last sequence supplied to `update()`
     /// # Errors
-    /// * If the edit distance cannot be increased further and it needs to be.
+    /// * If this DWFA has already been successfully finalized.
     pub fn finalize(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
         match self.state {
             DWFALiteState::Finalized => {
@@ -418,7 +425,11 @@ impl DWFALite {
             DWFALiteState::ExceededEditDistanceLimit => return Ok(()),
             DWFALiteState::Active => {},
         };
-        while self.maximum_baseline_distance() < baseline_seq.len() {
+        while if self.config.allow_early_termination {
+            self.maximum_baseline_distance() < baseline_seq.len()
+        } else {
+            !self.reached_global_end(baseline_seq.len(), other_seq.len())
+        } {
             if self.edit_distance_at_limit() {
                 self.state = DWFALiteState::ExceededEditDistanceLimit;
                 return Ok(());
@@ -427,9 +438,9 @@ impl DWFALite {
             // edits have a closed form. Values only grow, so this stays true. The scan usually stops at once, on a low
             // diagonal that has not reached the end. In the worst case, it adds one pass per edit to the growth pass.
             if self.wavefront.len() > FRONTIER_BITS && self.wavefront.iter().all(|&d| d + self.offset >= other_seq.len()) {
-                self.finish_without_matches(baseline_seq.len());
+                self.finish_without_matches(baseline_seq.len(), other_seq.len());
             } else {
-                // while we have not reached the end of the primary sequence
+                // The selected endpoint still needs another edit.
                 self.increase_edit_distance(baseline_seq, other_seq)?;
             }
         }
@@ -440,6 +451,21 @@ impl DWFALite {
     /// True when the next edit would pass the cap resolved at construction.
     fn edit_distance_at_limit(&self) -> bool {
         self.config.max_edit_distance.is_some_and(|limit| self.edit_distance >= limit)
+    }
+
+    /// Proves that one path reaches both endpoints, rather than combining separate coordinate maxima.
+    fn reached_global_end(&self, baseline_len: usize, other_len: usize) -> bool {
+        let m = other_len - self.offset;
+        let gap = m.abs_diff(baseline_len);
+        if gap > self.edit_distance {
+            return false;
+        }
+        let terminal = if m >= baseline_len {
+            self.edit_distance + gap
+        } else {
+            self.edit_distance - gap
+        };
+        self.wavefront[terminal] >= m
     }
 
     /// Helper function that will determine the farthest distance reached into the `baseline_seq` so far.
@@ -586,24 +612,39 @@ mod tests {
     /// `finalize()` with the closed form against growth one edit at a time, with caps and offsets
     #[test]
     fn test_bulk_finalize_matches_individual_growth() {
-        for cap in [None, Some(63), Some(64), Some(65), Some(200), Some(800)] {
-            for offset in [0, 7] {
-                let baseline = vec![b'A'; 800];
-                let other = vec![b'C'; offset + 30];
-                let mut actual = DWFALite::new(dwfa_config(None, false, cap));
-                actual.set_offset(offset);
-                actual.update(&baseline, &other).unwrap();
-                let mut expected = actual.clone();
-                while expected.max_baseline < baseline.len() && !expected.edit_distance_at_limit() {
-                    expected.increase_edit_distance(&baseline, &other).unwrap();
+        for early in [false, true] {
+            for cap in [None, Some(0), Some(63), Some(64), Some(65), Some(769), Some(770), Some(771), Some(799), Some(800), Some(801)] {
+                for offset in [0, 7] {
+                    // Matching and empty suffixes reach the wide all-lanes bulk guard.
+                    for suffix in [vec![b'C'; 30], vec![b'A'; 30], vec![]] {
+                        let baseline = vec![b'A'; 800];
+                        let mut other = vec![17; offset];
+                        other.extend_from_slice(&suffix);
+                        let distance = if suffix.first() == Some(&b'A') { 770 } else { 800 };
+                        let mut actual = DWFALite::new(dwfa_config(None, early, cap));
+                        actual.set_offset(offset);
+                        actual.update(&baseline, &other).unwrap();
+                        let mut expected = actual.clone();
+                        let mut reaches_bulk_guard = false;
+                        while expected.edit_distance() < distance && !expected.edit_distance_at_limit() {
+                            reaches_bulk_guard |= expected.wavefront().len() > FRONTIER_BITS
+                                && expected.wavefront().iter().all(|&d| d + offset >= other.len());
+                            expected.increase_edit_distance(&baseline, &other).unwrap();
+                        }
+                        if suffix.first() != Some(&b'C') && cap.is_none_or(|cap| cap > 64) {
+                            assert!(reaches_bulk_guard);
+                        }
+                        actual.finalize(&baseline, &other).unwrap();
+                        assert_eq!(actual.edit_distance(), cap.map_or(distance, |cap| distance.min(cap)));
+                        assert_eq!(actual.state(), if cap.is_some_and(|cap| cap < distance) {
+                            DWFALiteState::ExceededEditDistanceLimit
+                        } else { DWFALiteState::Finalized });
+                        assert_eq!(actual.wavefront(), expected.wavefront(),
+                            "cap {cap:?}, offset {offset}, early {early}, suffix {suffix:?}");
+                        assert_eq!(actual.maximum_other_distance(), expected.maximum_other_distance());
+                        assert_eq!(actual.maximum_baseline_distance(), expected.maximum_baseline_distance());
+                    }
                 }
-                expected.state = if expected.max_baseline < baseline.len() {
-                    DWFALiteState::ExceededEditDistanceLimit
-                } else {
-                    DWFALiteState::Finalized
-                };
-                actual.finalize(&baseline, &other).unwrap();
-                assert_eq!(actual, expected, "cap {cap:?}, offset {offset}");
             }
         }
     }
@@ -666,12 +707,8 @@ mod tests {
                     dwfa = dwfa.clone();
                 }
             }
-            // `finalize` stops when any diagonal reaches the baseline end, also before the end of `other`.
-            // So it returns the best cost to the baseline end over every prefix of `other`, but never less than before.
-            let update_ed = dwfa.edit_distance();
             dwfa.finalize(&baseline, &other).unwrap();
-            let best_to_baseline_end = *table[baseline.len()].iter().min().unwrap();
-            assert_eq!(dwfa.edit_distance(), update_ed.max(best_to_baseline_end), "trial {trial}, finalized");
+            assert_eq!(dwfa.edit_distance(), table[baseline.len()][other.len() - offset], "trial {trial}, finalized");
             max_seen = max_seen.max(dwfa.edit_distance());
         }
         // make sure the wide-wavefront fallback was exercised
@@ -684,7 +721,8 @@ mod tests {
     /// * `baseline` - the baseline sequence, theoretically fixed
     /// * `other` - the other sequence
     /// * `wildcard` - an optional wildcard symbol; a baseline symbol equal to it matches anything
-    fn reference_wavefront(baseline: &[u8], other: &[u8], wildcard: Option<u8>) -> (usize, Vec<usize>, usize) {
+    /// * `final_distance` - the terminal distance from the independent DP table
+    fn reference_wavefront(baseline: &[u8], other: &[u8], wildcard: Option<u8>, final_distance: usize) -> (usize, Vec<usize>) {
         let extend = |wavefront: &mut Vec<usize>, ed: usize| {
             for (i, d) in wavefront.iter_mut().enumerate() {
                 while *d + ed - i < baseline.len() && *d < other.len() &&
@@ -702,7 +740,6 @@ mod tests {
             }
             *wavefront = new_wavefront;
         };
-        let max_baseline = |wavefront: &[usize], ed: usize| wavefront.iter().enumerate().map(|(i, &d)| d + ed - i).max().unwrap();
 
         let (mut ed, mut wavefront) = (0, vec![0]);
         extend(&mut wavefront, ed);
@@ -712,12 +749,12 @@ mod tests {
             extend(&mut wavefront, ed);
         }
         let update_ed = ed;
-        while max_baseline(&wavefront, ed) < baseline.len() {
+        while ed < final_distance {
             ed += 1;
             grow(&mut wavefront);
             extend(&mut wavefront, ed);
         }
-        (update_ed, wavefront, ed)
+        (update_ed, wavefront)
     }
 
     /// Like the `finalize` benchmark: `other` is `baseline` without one stretch, with a few errors.
@@ -746,8 +783,9 @@ mod tests {
             // also swap the roles, so that `other` is the longer sequence
             let (baseline, other) = if trial % 2 == 0 { (baseline, other) } else { (other, baseline) };
 
-            let (expected_update, expected_wavefront, expected_final) = reference_wavefront(&baseline, &other, wildcard);
             let table = reference_table(&baseline, &other, wildcard);
+            let expected_final = table[baseline.len()][other.len()];
+            let (expected_update, expected_wavefront) = reference_wavefront(&baseline, &other, wildcard, expected_final);
             assert_eq!(expected_update, (0..=baseline.len()).map(|k| table[k][other.len()]).min().unwrap(), "trial {trial}");
 
             let mut dwfa = DWFALite::new(dwfa_config(wildcard, false, None));

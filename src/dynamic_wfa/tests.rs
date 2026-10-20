@@ -152,6 +152,48 @@ fn test_required_finalize() {
 }
 
 #[test]
+fn test_finalize_global_endpoint() {
+    let mut dwfa = DWFALite::default();
+    assert_eq!(dwfa.update(b"AC", b"CA").unwrap(), 1);
+    dwfa.finalize(b"AC", b"CA").unwrap();
+    assert_eq!(dwfa.edit_distance(), 2);
+    assert_eq!(dwfa.state(), DWFALiteState::Finalized);
+}
+
+#[test]
+fn test_finalize_endpoint_modes_and_caps() {
+    let cases: &[(&[u8], &[u8], usize, usize)] = &[
+        (b"AC", b"CA", 2, 1),
+        (b"AC", b"ACTT", 2, 0),
+        (b"ACTT", b"AC", 2, 2),
+        (b"", b"AC", 2, 0),
+        (b"AC", b"", 2, 2),
+        (b"", b"", 0, 0),
+    ];
+    for &(baseline, suffix, global_distance, early_distance) in cases {
+        for early in [false, true] {
+            let distance = if early { early_distance } else { global_distance };
+            for cap in [None, Some(0), Some(1), Some(2), Some(3)] {
+                for offset in [0, 2] {
+                    let mut other = vec![17; offset];
+                    other.extend_from_slice(suffix);
+                    let mut dwfa = DWFALite::new(dwfa_config(None, early, cap));
+                    dwfa.set_offset(offset);
+                    dwfa.update(baseline, &other).unwrap();
+                    dwfa.finalize(baseline, &other).unwrap();
+                    assert_eq!(dwfa.edit_distance(), cap.map_or(distance, |cap| distance.min(cap)),
+                        "{baseline:?}/{suffix:?}, early {early}, cap {cap:?}, offset {offset}");
+                    assert_eq!(dwfa.state(), if cap.is_some_and(|cap| distance > cap) {
+                        DWFALiteState::ExceededEditDistanceLimit
+                    } else { DWFALiteState::Finalized },
+                        "{baseline:?}/{suffix:?}, early {early}, cap {cap:?}, offset {offset}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn test_cloning() {
     let sequence     = b"AAAAAAA";
     let alt_sequence = b"AAACAAA";

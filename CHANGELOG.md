@@ -4,6 +4,9 @@
 * Single consensus results now report which reads were halted at that cap
 * Dual consensus results now report which allele each read belongs to, including reads that hit the cap on both alleles
 
+## Bugs
+* Correct global DWFA finalization to require the joint terminal endpoint, including mode-correct bulk finalization and endpoints reached exactly at an edit-distance cap. Early termination continues to allow an unused suffix of the other sequence.
+
 ## Performance
 * Replaced the search hash queue with a binary heap ordered by cached priority
 * `DWFALite` extends only the diagonals at the frontier after a push, and caches its maximum distances

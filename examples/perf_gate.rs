@@ -63,6 +63,20 @@ fn build_cases() -> Vec<Case> {
                 }
             }
         }
+        if !dual {
+            for er in [0.0, 0.01] {
+                let (_consensus, dataset) = generate_test(alphabet_size, 10000, 10, er);
+                cases.push(Case {
+                    label: format!("consensus_{alphabet_size}x10000x10_{er}"),
+                    input: Input::Consensus { min_count: 2, dataset },
+                });
+            }
+            let (_allele1, _allele2, dataset) = generate_dual_test(alphabet_size, 200, 5, 0.01, 4);
+            cases.push(Case {
+                label: "consensus_branch_4x200x10_0.01_diff4".to_owned(),
+                input: Input::Consensus { min_count: 2, dataset },
+            });
+        }
     }
     let (sl, er) = (4000, 0.01);
     for gap in [1000, 2000, 3000] {

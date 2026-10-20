@@ -50,6 +50,32 @@ pub fn bench_consensus(c: &mut Criterion) {
         }
     }
 
+    let config = CdwfaConfigBuilder::default().min_count(2).build().unwrap();
+    for er in [0.0, 0.01] {
+        let (_consensus, dataset) = generate_test(alphabet_size, 10000, 10, er);
+        let test_label = format!("consensus_{alphabet_size}x10000x10_{er}");
+        benchmark_group.bench_function(&test_label, |b| b.iter(|| {
+            black_box({
+                let mut consensus_dwfa = ConsensusDWFA::with_config(config.clone()).unwrap();
+                for s in &dataset {
+                    consensus_dwfa.add_sequence(s).unwrap();
+                }
+                consensus_dwfa.consensus().unwrap()
+            });
+        }));
+    }
+
+    let (_allele1, _allele2, dataset) = generate_dual_test(alphabet_size, 200, 5, 0.01, 4);
+    benchmark_group.bench_function("consensus_branch_4x200x10_0.01_diff4", |b| b.iter(|| {
+        black_box({
+            let mut consensus_dwfa = ConsensusDWFA::with_config(config.clone()).unwrap();
+            for s in &dataset {
+                consensus_dwfa.add_sequence(s).unwrap();
+            }
+            consensus_dwfa.consensus().unwrap()
+        });
+    }));
+
     benchmark_group.finish();
 }
 

@@ -377,7 +377,7 @@ impl DWFALite {
         };
         self.max_wavefront = grown.max_wavefront;
         self.max_baseline = grown.max_baseline;
-        self.frontier = tracked.then_some(grown.frontier);
+        self.frontier = grown.frontier;
         self.extended_len = other_seq.len();
         Ok(())
     }
@@ -399,12 +399,16 @@ impl DWFALite {
             // is the minimum number of edits, and `edit_distance` of those are already done.
             baseline_len.abs_diff(other_len - self.offset).saturating_sub(self.edit_distance)
         };
+
+        // cap the number of edits
         if let Some(limit) = self.config.max_edit_distance {
             steps = steps.min(limit.saturating_sub(self.edit_distance));
         }
         if steps == 0 {
             return;
         }
+
+        // apply the edits without matches
         grow_without_matches(&mut self.wavefront, self.edit_distance, steps);
         self.edit_distance += steps;
         self.max_wavefront += steps;

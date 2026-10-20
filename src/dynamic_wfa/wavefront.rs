@@ -131,6 +131,7 @@ pub(super) fn grow_wide_wavefront(
 /// Conceptually, this function plays out the wavefront edit distance extension.
 /// However, it assumes that the wavefronts are all at the end of the `other_seq`, so it can only add edits to the baseline.
 /// It uses some sliding window shortcuts to avoid computing all of the wavefront comparisons.
+/// See the test `test_growth_without_matches()` for a more intuitive example of what this computes.
 /// # Arguments
 /// * `wavefront` - the wavefront to replace
 /// * `edit_distance` - the edit distance of `wavefront` before these edits

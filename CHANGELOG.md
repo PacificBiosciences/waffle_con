@@ -14,6 +14,9 @@
 * The last child of a consensus node takes the parent node instead of a clone, and the dual search reuses the buffers of dropped nodes
 * The consensus and dual consensus benchmarks are 9.9x faster than v0.4.4 (geometric mean). Equal-vote ties follow the order each symbol is first seen, so a capped search can differ from v0.4.4. Uncapped results are still sorted by sequence.
 
+## Tests and benchmarks
+* Add independent DP and scalar-wavefront coverage for endpoint modes, caps, offsets, wildcards, update chunking, narrow/wide boundaries, and clone isolation.
+
 ## Breaking changes
 * `Consensus::new` now takes per-read assignments and returns a `Result`
 

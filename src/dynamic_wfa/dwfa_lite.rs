@@ -413,8 +413,8 @@ impl DWFALite {
     /// The baseline must remain unchanged, the other sequence must be append-only, and the offset
     /// must not exceed its length. Call `update()` before finalizing, including for empty sequences.
     /// # Arguments
-    /// * `baseline_seq` - the unchanged baseline sequence
-    /// * `other_seq` - the last sequence supplied to `update()`
+    /// * `baseline_seq` - the baseline sequence, theoretically fixed
+    /// * `other_seq` - the other sequence, typically getting updates
     /// # Errors
     /// * If this DWFA has already been successfully finalized.
     pub fn finalize(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
@@ -453,18 +453,29 @@ impl DWFALite {
         self.config.max_edit_distance.is_some_and(|limit| self.edit_distance >= limit)
     }
 
-    /// Proves that one path reaches both endpoints, rather than combining separate coordinate maxima.
+    /// Checks whether a single alignment path has reached the ends of both sequences.
+    ///
+    /// For example, aligning "ABC" with "ABXYC" at offset 0 needs two insertions.
+    /// At edit distance 2, the middle index is 2 and `gap` is 2, so we check index 4.
+    /// If that entry has reached at least 5 bases in the other sequence, it has also
+    /// reached all 3 bases in the baseline, so both sequences are finished.
     fn reached_global_end(&self, baseline_len: usize, other_len: usize) -> bool {
+        // Only the part of `other_seq` after `offset` is included in this alignment
         let m = other_len - self.offset;
         let gap = m.abs_diff(baseline_len);
+        // We need at least `gap` edits just to make up the difference in sequence lengths
         if gap > self.edit_distance {
             return false;
         }
+        // The middle diagonal (index `edit_distance`) uses equal lengths from both sequences
+        // Move right for a longer `other_seq` suffix, or left for a longer baseline
         let terminal = if m >= baseline_len {
             self.edit_distance + gap
         } else {
             self.edit_distance - gap
         };
+        // Each entry stores how far we reached in `other_seq`, starting at `offset`
+        // On this diagonal, reaching `m` means we have reached both sequence ends
         self.wavefront[terminal] >= m
     }
 
@@ -609,36 +620,61 @@ mod tests {
     use super::super::dwfa_config::DWFALiteConfigBuilder;
     use super::super::wavefront::FRONTIER_BITS;
 
-    /// `finalize()` with the closed form against growth one edit at a time, with caps and offsets
+    /// Checks that finishing many edits at once gives the same result as adding one edit at a time
     #[test]
     fn test_bulk_finalize_matches_individual_growth() {
+        // Global mode must finish both sequences, early mode only needs to finish the baseline
         for early in [false, true] {
+            // Try no cap, a zero cap, and caps around the wide-wavefront boundary (64 edits)
+            // and the expected final distances (770 or 800 edits)
             for cap in [None, Some(0), Some(63), Some(64), Some(65), Some(769), Some(770), Some(771), Some(799), Some(800), Some(801)] {
+                // Skipping a seven-byte prefix should give the same result as starting at position 0
                 for offset in [0, 7] {
-                    // Matching and empty suffixes reach the wide all-lanes bulk guard.
-                    for suffix in [vec![b'C'; 30], vec![b'A'; 30], vec![]] {
+                    // Compare mismatching, matching, and empty inputs against a baseline of 800 A bases
+                    for suffix in [
+                        // No C bases match the baseline, so both modes need 800 edits
+                        vec![b'C'; 30],
+                        // These 30 A bases match, leaving 770 bases that need edits
+                        vec![b'A'; 30],
+                        // With no other bases to match, all 800 baseline bases need edits
+                        vec![],
+                    ] {
+                        // Setup: prepare the sequences and update the alignment before finalizing
                         let baseline = vec![b'A'; 800];
                         let mut other = vec![17; offset];
                         other.extend_from_slice(&suffix);
+                        // The all-A suffix matches 30 of the 800 baseline bases, leaving 770 edits
+                        // The all-C and empty suffixes match nothing, so all 800 baseline bases need edits
                         let distance = if suffix.first() == Some(&b'A') { 770 } else { 800 };
                         let mut actual = DWFALite::new(dwfa_config(None, early, cap));
                         actual.set_offset(offset);
                         actual.update(&baseline, &other).unwrap();
+
+                        // Expected setup: grow a copy one edit at a time until finished or capped
                         let mut expected = actual.clone();
                         let mut reaches_bulk_guard = false;
                         while expected.edit_distance() < distance && !expected.edit_distance_at_limit() {
+                            // Bulk growth is possible once the wavefront is too wide for the bitmask
+                            // and every diagonal has reached the end of the other sequence
                             reaches_bulk_guard |= expected.wavefront().len() > FRONTIER_BITS
                                 && expected.wavefront().iter().all(|&d| d + offset >= other.len());
                             expected.increase_edit_distance(&baseline, &other).unwrap();
                         }
+
+                        // Matching and empty inputs should reach bulk growth unless the cap stops them at 64 or earlier
                         if suffix.first() != Some(&b'C') && cap.is_none_or(|cap| cap > 64) {
                             assert!(reaches_bulk_guard);
                         }
+
+                        // Compare: finalize normally and check the result against individual growth
                         actual.finalize(&baseline, &other).unwrap();
+
+                        // The distance stops at the cap, the state says whether more edits were still needed
                         assert_eq!(actual.edit_distance(), cap.map_or(distance, |cap| distance.min(cap)));
                         assert_eq!(actual.state(), if cap.is_some_and(|cap| cap < distance) {
                             DWFALiteState::ExceededEditDistanceLimit
                         } else { DWFALiteState::Finalized });
+                        // Check the full wavefront and cached positions too, not just the distance
                         assert_eq!(actual.wavefront(), expected.wavefront(),
                             "cap {cap:?}, offset {offset}, early {early}, suffix {suffix:?}");
                         assert_eq!(actual.maximum_other_distance(), expected.maximum_other_distance());

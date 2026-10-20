@@ -162,18 +162,29 @@ fn test_finalize_global_endpoint() {
 
 #[test]
 fn test_finalize_endpoint_modes_and_caps() {
+    // Each case: (baseline, other sequence after the offset, expected global distance, expected early-termination distance)
     let cases: &[(&[u8], &[u8], usize, usize)] = &[
+        // Early mode skips the baseline's A and matches C, global mode also needs an edit for the trailing A in CA
         (b"AC", b"CA", 2, 1),
+        // Early mode stops after AC, global mode needs two more edits for the extra TT
         (b"AC", b"ACTT", 2, 0),
+        // Both modes must reach the baseline's end, so both need two edits for its unmatched TT
         (b"ACTT", b"AC", 2, 2),
+        // An empty baseline is already finished in early mode, global mode needs two edits for AC
         (b"", b"AC", 2, 0),
+        // The other sequence is empty, so both modes need two edits for the baseline's AC
         (b"AC", b"", 2, 2),
+        // Both sequences are empty, so neither mode needs any edits
         (b"", b"", 0, 0),
     ];
+    // Run every sequence pair with all combinations of mode, edit cap, and starting offset
     for &(baseline, suffix, global_distance, early_distance) in cases {
+        // Global mode must finish both sequences, early mode only needs to finish the baseline
         for early in [false, true] {
             let distance = if early { early_distance } else { global_distance };
+            // Try unlimited edits and caps below, at, or above the expected distance
             for cap in [None, Some(0), Some(1), Some(2), Some(3)] {
+                // Skipping a two-byte prefix should give the same result as starting at position 0
                 for offset in [0, 2] {
                     let mut other = vec![17; offset];
                     other.extend_from_slice(suffix);

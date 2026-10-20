@@ -326,7 +326,7 @@ impl<'a> ConsensusDWFA<'a> {
             // this fetches the list of options according to the WFA so far
             // NOTE: this CAN include the wildcard, but only if the wildcard is the only character
             // with 2+ candidates, the wildcard is removed, so something is left over
-            top_node.summary.votes.candidates(self.config.wildcard, &mut extension_candidates, step_context.scratch.orders());
+            top_node.candidates(self.config.wildcard, &mut extension_candidates);
             let max_observed = extension_candidates.iter().map(|&(_symbol, count)| count).max_by(|a, b| a.total_cmp(b))
                 // if no observation, then just use min count
                 .unwrap_or(self.config.min_count as f64);
@@ -694,6 +694,16 @@ impl ConsensusNode {
                 ConsensusCost::L2Distance => d.edit_distance().pow(2)
             })
             .sum()
+    }
+
+    /// Writes this node's extension candidates into `out`.
+    /// When there are two or more candidates, `wildcard` is removed. One candidate is kept as it is,
+    /// including when that candidate is the wildcard.
+    /// # Arguments
+    /// * `wildcard` - an optional wildcard symbol
+    /// * `out` - output buffer; it is cleared first
+    fn candidates(&self, wildcard: Option<u8>, out: &mut Vec<(u8, f64)>) {
+        self.summary.votes.candidates(wildcard, out);
     }
 
     // getters

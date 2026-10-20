@@ -241,6 +241,7 @@ fn test_offsets() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn test_exact_match_under_edit_distance_cap() {
     let sequence = b"ACGTACGT";
     let mut dwfa = dwfa_with_consensus_cap(sequence.len(), Some(2), None, None).unwrap();
@@ -251,6 +252,7 @@ fn test_exact_match_under_edit_distance_cap() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn test_hard_edit_distance_cap() {
     let baseline = b"ACGTACGTACGT";
     let other = b"TTTTTTTTTTTT";
@@ -268,6 +270,7 @@ fn test_hard_edit_distance_cap() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn test_fractional_edit_distance_cap() {
     let baseline = vec![b'A'; 100];
     let mut other = vec![b'T'; 6];

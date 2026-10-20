@@ -428,10 +428,10 @@ impl DWFALite {
             // diagonal that has not reached the end. In the worst case, it adds one pass per edit to the growth pass.
             if self.wavefront.len() > FRONTIER_BITS && self.wavefront.iter().all(|&d| d + self.offset >= other_seq.len()) {
                 self.finish_without_matches(baseline_seq.len());
-                continue;
+            } else {
+                // while we have not reached the end of the primary sequence
+                self.increase_edit_distance(baseline_seq, other_seq)?;
             }
-            // while we have not reached the end of the primary sequence
-            self.increase_edit_distance(baseline_seq, other_seq)?;
         }
         self.state = DWFALiteState::Finalized;
         Ok(())
@@ -467,7 +467,9 @@ impl DWFALite {
     /// # Arguments
     /// * `baseline_seq` - the baseline sequence, theoretically fixed
     /// * `other_seq` - the other sequence, typically getting updates
-    pub fn get_extension_candidates(&self, baseline_seq: &[u8], other_seq: &[u8]) -> HashMap<u8, usize> {
+    #[allow(dead_code)]
+    #[deprecated(note = "use `extension_symbols` instead")]
+    pub(super) fn get_extension_candidates(&self, baseline_seq: &[u8], other_seq: &[u8]) -> HashMap<u8, usize> {
         if self.state == DWFALiteState::ExceededEditDistanceLimit {
             return Default::default();
         }
@@ -535,6 +537,7 @@ impl DWFALite {
         if self.state == DWFALiteState::ExceededEditDistanceLimit {
             return;
         }
+        // try to short-circuit the extension symbols computation
         if let Some(bits) = self.frontier {
             let low_bits = bits as u64;
             if other_seq.len() == self.extended_len && (bits >> 64) == 0 && low_bits & low_bits.wrapping_sub(1) == 0 {
@@ -549,9 +552,11 @@ impl DWFALite {
                 return;
             }
         }
+
+        // otherwise, compute the full set of extension symbols
         scratch.symbols.clear();
         self.extension_symbols(baseline_seq, other_seq, &mut scratch.symbols);
-        votes.add(&scratch.symbols, weight, &mut scratch.orders);
+        votes.add(&scratch.symbols, weight, &mut scratch.counts);
     }
 
     // Getters below
@@ -758,6 +763,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_extension_symbols_match_candidates() {
         let baseline = b"ACGTTACGGA";
         let other = b"ACTTAC";

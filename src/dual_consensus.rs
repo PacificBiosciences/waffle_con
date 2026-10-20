@@ -51,7 +51,7 @@ use std::cmp::{Ordering, Reverse};
 
 use crate::cdwfa_config::{CdwfaConfig, ConsensusCost};
 use crate::consensus::Consensus;
-use crate::dynamic_wfa::{DWFALite, DWFALiteState, VoteBuffers};
+use crate::dynamic_wfa::{DWFALite, DWFALiteState, ExtensionVotes, VoteScratch};
 use crate::node_pool::NodePool;
 use crate::pqueue_tracker::PQueueTracker;
 use crate::priority_queue::{CachePriority, PriorityQueue};
@@ -373,7 +373,8 @@ impl<'a> DualConsensusDWFA<'a> {
 
         // buffers that each search step reuses
         let mut node_pool = NodePool::new();
-        let mut vote_buffers = VoteBuffers::default();
+        let mut votes = ExtensionVotes::default();
+        let mut scratch = VoteScratch::default();
         let mut extension_candidates1: Vec<(u8, f64)> = vec![];
         let mut extension_candidates2: Vec<(u8, f64)> = vec![];
         let mut opt_ec1: Vec<Option<u8>> = vec![];
@@ -567,7 +568,7 @@ impl<'a> DualConsensusDWFA<'a> {
             // this fetches the list of options according to the WFA so far
             // NOTE: this CAN include the wildcard, but only if the wildcard is the only character
             let weighted_by_ed = self.config.weighted_by_ed;
-            top_node.get_extension_candidates(&self.sequences, self.config.wildcard, true, weighted_by_ed, &mut vote_buffers, &mut extension_candidates1);
+            top_node.get_extension_candidates(&self.sequences, self.config.wildcard, true, weighted_by_ed, &mut votes, &mut scratch, &mut extension_candidates1);
             // let min_count1 = active_min_count[top_len];
             let min_count1 = self.config.min_count.max(
                 (self.config.min_af * extension_candidates1.iter().map(|&(_symbol, count)| count).sum::<f64>()).ceil() as u64
@@ -581,7 +582,7 @@ impl<'a> DualConsensusDWFA<'a> {
 
             if top_node.is_dual {
                 // get the second candidate set also
-                top_node.get_extension_candidates(&self.sequences, self.config.wildcard, false, weighted_by_ed, &mut vote_buffers, &mut extension_candidates2);
+                top_node.get_extension_candidates(&self.sequences, self.config.wildcard, false, weighted_by_ed, &mut votes, &mut scratch, &mut extension_candidates2);
                 // let min_count2 = active_min_count[top_len];
                 let min_count2 = self.config.min_count.max(
                     (self.config.min_af * extension_candidates2.iter().map(|&(_symbol, count)| count).sum::<f64>()).ceil() as u64
@@ -1477,11 +1478,13 @@ impl DualConsensusNode {
     /// * `wildcard` - an optional wildcard character, will be removed from return set unless it is the only value in it
     /// * `is_consensus1` - if True, this will check consensus1 DWFAs, otherwise it checks those for consensus2
     /// * `weighted_by_ed` - if True, then the weights are scaled based on the dual weights comparison; e.g. if ed1 = 2 and ed2 = 4, then weights for consensus 1 are ~1/3 and for consensus 2 are ~2/3 of the total
-    /// * `vote_buffers` - reusable buffers for the votes
+    /// * `votes` - accumulated extension votes; cleared first
+    /// * `scratch` - symbol and count buffers for one DWFA
     /// * `candidates` - output buffer; it is cleared first
+    #[allow(clippy::too_many_arguments)]
     fn get_extension_candidates(
         &self, baseline_sequences: &[&[u8]], wildcard: Option<u8>, is_consensus1: bool, weighted_by_ed: bool,
-        vote_buffers: &mut VoteBuffers, candidates: &mut Vec<(u8, f64)>
+        votes: &mut ExtensionVotes, scratch: &mut VoteScratch, candidates: &mut Vec<(u8, f64)>
     ) {
         // get the relevant DWFAs
         let dwfa_iter = if is_consensus1 {
@@ -1505,19 +1508,19 @@ impl DualConsensusNode {
         };
 
         // now pull out all the candidates and count how many times they were voted on
-        vote_buffers.clear();
+        votes.clear();
         for (seq_index, (&baseline_seq, opt_dwfa)) in baseline_sequences.iter().zip(dwfa_iter).enumerate() {
             let weight = weights.as_ref().map_or(1.0, |w| w[seq_index]);
             if weight > 0.0 {
                 if let Some(dwfa) = opt_dwfa {
                     // each DWFA splits one weighted vote over the symbols it nominates
-                    vote_buffers.add(dwfa, baseline_seq, consensus_seq, weight);
+                    dwfa.vote(baseline_seq, consensus_seq, weight, votes, scratch);
                 }
             }
         }
 
         // with 2+ candidates, the wildcard is removed, so something is left over
-        vote_buffers.candidates(wildcard, candidates);
+        votes.candidates(wildcard, candidates);
     }
 
     /// This returns a series of weights that are scaled based on the edit distances to con1 and con2.

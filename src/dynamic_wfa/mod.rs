@@ -11,4 +11,4 @@ mod tests;
 
 pub use dwfa_config::{DWFALiteConfig, DWFALiteConfigBuilder};
 pub use dwfa_lite::{DWFALite, DWFALiteState};
-pub(crate) use votes::{ExtensionVotes, VoteBuffers, VoteScratch};
+pub(crate) use votes::{ExtensionVotes, VoteScratch};

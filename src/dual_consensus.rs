@@ -1527,6 +1527,7 @@ impl DualConsensusNode {
     /// For example, if ed1 = 2 and ed2 = 5, then a consensus1 scaled ed would be ~ 5 / (2+5).
     /// Conversely, the weight for consensus2 would be ~ 2 / (2+5).
     /// If `weight_by_ed` is False, this will instead just return 0.0, 0.5, or 1.0; giving full weight when one consensus is better.
+    /// Cap-exceeded alignments are treated as untracked, so a surviving alignment retains its full weight.
     /// # Arguments
     /// * `is_consensus` - If True, then return weights for consensus 1, otherwise consensus 2.
     /// * `weight_by_ed` - If True, then weights are scaled by the relative edit distances. If False, then weights are either 0.0 or 1.0 typically, with 0.5 when equal.
@@ -1537,8 +1538,10 @@ impl DualConsensusNode {
             let equality_score = 0.5; // using 0.0 means don't let something that isn't for sure mapped here have a vote
             self.dwfas1.iter().zip(self.dwfas2.iter())
                 .map(|(d1, d2)| {
-                    let c1 = d1.as_ref().map(|d| (d.edit_distance() as f64).max(min_ed));
-                    let c2 = d2.as_ref().map(|d| (d.edit_distance() as f64).max(min_ed));
+                    let c1 = d1.as_ref().filter(|d| d.state() != DWFALiteState::ExceededEditDistanceLimit)
+                        .map(|d| (d.edit_distance() as f64).max(min_ed));
+                    let c2 = d2.as_ref().filter(|d| d.state() != DWFALiteState::ExceededEditDistanceLimit)
+                        .map(|d| (d.edit_distance() as f64).max(min_ed));
                     
                     if let (Some(v1), Some(v2)) = (c1, c2) {
                         if weight_by_ed {
@@ -2283,6 +2286,61 @@ mod tests {
     #[test]
     fn test_csv_dual_001() {
         run_test_file("./tests/dual_001.csv", true, None);
+    }
+
+    #[test]
+    fn test_weighted_capped_competitor_preserves_supported_consensus() {
+        use SequenceAssignment::{Consensus1, Consensus2, EditDistanceLimit};
+
+        // Changing the other allele's support exercises either internal allele ordering.
+        for other_count in [2, 4] {
+            let mut reads: Vec<&[u8]> = vec![b"ACCA", b"ACCG", b"ACTT"];
+            reads.extend(std::iter::repeat_n(b"GTGG".as_slice(), other_count));
+
+            for weighted in [false, true] {
+                let config = CdwfaConfigBuilder::default()
+                    .max_edit_distance(Some(1))
+                    .min_count(1)
+                    .weighted_by_ed(weighted)
+                    .build().unwrap();
+                let mut engine = DualConsensusDWFA::with_config(config).unwrap();
+                for &read in &reads {
+                    engine.add_sequence(read).unwrap();
+                }
+
+                // At AC / GT, each read has exceeded the cap on the opposite allele.
+                // ACTT's next T must retain its full vote to meet min_count=1.
+                // All three A-starting consensuses have the same capped total cost.
+                let fixtures = [
+                    (b"ACCA", &[0, 1][..], [Consensus1, Consensus1, EditDistanceLimit], [0, 1, 1]),
+                    (b"ACCG", &[1, 0][..], [Consensus1, Consensus1, EditDistanceLimit], [1, 0, 1]),
+                    (b"ACTT", &[0][..], [EditDistanceLimit, EditDistanceLimit, Consensus1], [1, 1, 0]),
+                ];
+                let expected: Vec<_> = fixtures.iter().map(|&(sequence, scores, assignments, scores1)| {
+                    let mut assignments = assignments.to_vec();
+                    assignments.extend(std::iter::repeat_n(Consensus2, other_count));
+                    let mut scores1: Vec<_> = scores1.into_iter().map(Some).collect();
+                    scores1.extend(std::iter::repeat_n(Some(1), other_count));
+                    let mut scores2 = vec![Some(1); 3];
+                    scores2.extend(std::iter::repeat_n(Some(0), other_count));
+                    DualConsensus::new(
+                        Consensus::new(sequence.to_vec(), ConsensusCost::L1Distance, scores.to_vec(), None).unwrap(),
+                        Some(Consensus::new(b"GTGG".to_vec(), ConsensusCost::L1Distance, vec![0; other_count], None).unwrap()),
+                        assignments,
+                        scores1,
+                        scores2,
+                    ).unwrap()
+                }).collect();
+
+                let actual = engine.consensus().unwrap();
+                assert_eq!(actual, expected, "weighted={weighted}, other_count={other_count}");
+                // DualConsensus equality does not compare the full per-allele score arrays.
+                for (actual, expected) in actual.iter().zip(&expected) {
+                    assert_eq!(actual.scores1(), expected.scores1());
+                    assert_eq!(actual.scores2(), expected.scores2());
+                }
+            }
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 
 /// Extension votes from several DWFAs.
-/// Symbols stay in the order of their first vote. Equal totals keep that order when the search pushes children.
+/// Symbols stay in the order of their first vote. This vector is not sorted by weight.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ExtensionVotes {
     /// Votes in order of the first vote for each symbol. The alphabet is small, so a linear search is fast.
@@ -11,23 +11,26 @@ impl ExtensionVotes {
     /// Adds the votes of one DWFA. Each symbol gets `weight * count / symbols.len()`.
     /// A symbol's first vote is recorded in the order it appears in `symbols`.
     /// Usually all symbols are equal, and then the whole weight goes to that symbol.
+    /// That path stays bit-identical to `add_single`.
     /// # Arguments
-    /// * `symbols` - the output of `DWFALite::extension_symbols()` for one DWFA
     /// * `weight` - the total weight of this DWFA's vote
-    /// * `counts` - first-seen counts for this vote; cleared and reused; expected to come from `VoteScratch::counts`
-    pub(crate) fn add(&mut self, symbols: &[u8], weight: f64, counts: &mut Vec<(u8, usize)>) {
-        let Some(&first) = symbols.first() else {
-            // no symbols, skip the vote
+    /// * `scratch` - reusable buffers; the VoteScratch.symbols are expected to be populated by the DWFA,
+    ///   and the VoteScratch.counts are cleared and modified by this function
+    pub(crate) fn add(&mut self, weight: f64, scratch: &mut VoteScratch) {
+        let Some(&first) = scratch.symbols.first() else {
+            // This DWFA nominates nothing, so its weight is dropped.
             return;
         };
 
-        // if all symbols are the same, put all the weight on the only symbol
-        if symbols.iter().all(|&s| s == first) {
+        // All symbols are the same, so the whole weight goes to that symbol.
+        // This stays bit-identical to `add_single`.
+        if scratch.symbols.iter().all(|&s| s == first) {
             self.add_vote(first, weight);
             return;
         }
 
         // otherwise, we have to split the weight, keeping the first-seen order
+        let VoteScratch { symbols, counts } = scratch;
         let vote_split = symbols.len() as f64;
         counts.clear();
         for &symbol in symbols.iter() {
@@ -41,7 +44,7 @@ impl ExtensionVotes {
         }
     }
 
-    /// Adds the vote of a DWFA that nominates one symbol, the same as `add(&[symbol], weight)`.
+    /// Adds the vote of a DWFA that nominates one symbol, the same as `add` with a one-symbol `VoteSymbols` buffer.
     /// # Arguments
     /// * `symbol` - the symbol this DWFA nominates
     /// * `weight` - the total weight of this DWFA's vote
@@ -57,6 +60,7 @@ impl ExtensionVotes {
     #[inline]
     fn add_vote(&mut self, symbol: u8, vote: f64) {
         match self.votes.iter_mut().find(|(s, _)| *s == symbol) {
+            // An existing symbol keeps its place and gains `vote`. A new symbol is appended.
             Some((_, total)) => *total += vote,
             None => self.votes.push((symbol, vote)),
         };
@@ -75,23 +79,40 @@ impl ExtensionVotes {
     /// * `out` - output buffer; it is cleared first
     pub(crate) fn candidates(&self, wildcard: Option<u8>, out: &mut Vec<(u8, f64)>) {
         out.clear();
+        // One symbol, or none: keep it, even when it is the wildcard.
         if self.votes.len() <= 1 {
             out.extend_from_slice(&self.votes);
             return;
         }
+        // Symbols in `votes` are distinct, so dropping the wildcard leaves at least one.
         out.extend(self.votes.iter().copied().filter(|&(symbol, _)| wildcard != Some(symbol)));
     }
 }
 
-/// Distinct symbols in one mixed vote. DNA, a wildcard, and the ambiguity codes fit, so the buffer does not grow.
+/// Distinct symbols expected in one mixed vote. DNA, a wildcard, and the ambiguity codes fit.
+/// This is only a starting capacity.
 const MIXED_SYMBOL_CAPACITY: usize = 16;
 
-/// Buffers for a DWFA vote with more than one frontier diagonal
+/// Symbols nominated by one DWFA. `VoteScratch::clear` empties this buffer and reuses it.
+/// The one-symbol path does not use it.
+pub(crate) type VoteSymbols = Vec<u8>;
+
+/// First-seen symbol counts for one mixed vote. `ExtensionVotes::add` clears this buffer and reuses it.
+pub(crate) type VoteCounts = Vec<(u8, usize)>;
+
+/// Buffers for a DWFA vote with more than one frontier diagonal.
 #[derive(Debug)]
 pub(crate) struct VoteScratch {
-    pub(super) symbols: Vec<u8>,
-    /// First-seen symbol counts for one mixed vote. Cleared by `ExtensionVotes::add` and reused.
-    pub(super) counts: Vec<(u8, usize)>,
+    pub(super) symbols: VoteSymbols,
+    pub(super) counts: VoteCounts,
+}
+
+impl VoteScratch {
+    /// Clears both buffers and keeps their allocations.
+    pub(crate) fn clear(&mut self) {
+        self.symbols.clear();
+        self.counts.clear();
+    }
 }
 
 impl Default for VoteScratch {
@@ -120,7 +141,7 @@ mod tests {
             return;
         }
         let vote_split = symbols.len() as f64;
-        let mut counts: Vec<(u8, usize)> = Vec::new();
+        let mut counts: VoteCounts = Vec::new();
         for &symbol in symbols.iter() {
             match counts.iter_mut().find(|(seen, _)| *seen == symbol) {
                 Some((_, count)) => *count += 1,
@@ -141,16 +162,17 @@ mod tests {
     fn test_extension_votes_are_first_seen() {
         use rand::{Rng, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(11);
-        let mut counts = Vec::with_capacity(MIXED_SYMBOL_CAPACITY);
+        let mut scratch = VoteScratch::default();
         for trial in 0..4000 {
             let alphabet: &[u8] = if trial % 4 == 0 { b"ACGT*NRYKMSW" } else { b"ACGT*N" };
             let mut expected: Vec<(u8, f64)> = Vec::new();
             let mut votes = ExtensionVotes::default();
             for _ in 0..rng.gen_range(0..10) {
-                let symbols: Vec<u8> = (0..rng.gen_range(0..10)).map(|_| alphabet[rng.gen_range(0..alphabet.len())]).collect();
+                scratch.clear();
+                scratch.symbols.extend((0..rng.gen_range(0..10)).map(|_| alphabet[rng.gen_range(0..alphabet.len())]));
                 let weight = [1.0, 0.5, 0.25, 0.9][rng.gen_range(0..4)];
-                add_expected(&mut expected, &symbols, weight);
-                votes.add(&symbols, weight, &mut counts);
+                add_expected(&mut expected, &scratch.symbols, weight);
+                votes.add(weight, &mut scratch);
             }
             let to_bits = |pairs: &[(u8, f64)]| pairs.iter().map(|&(k, v)| (k, v.to_bits())).collect::<Vec<_>>();
             let mut actual = vec![];

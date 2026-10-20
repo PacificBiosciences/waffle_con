@@ -1,6 +1,7 @@
 # Unreleased
 ## Features
 * Added optional edit-distance caps to the config so a read stops contributing once it diverges too far: a hard maximum, a fraction of the read length, and a floor on the resolved cap. By default, none of these are set, matching previous behavior. Set them to improve performance when highly divergent reads are part of the input set.
+* In edit-distance-weighted dual consensus, cap-exceeded alignments no longer dilute the surviving alignment's extension votes.
 * Single consensus results now report which reads were halted at that cap
 * Dual consensus results now report which allele each read belongs to, including reads that hit the cap on both alleles
 

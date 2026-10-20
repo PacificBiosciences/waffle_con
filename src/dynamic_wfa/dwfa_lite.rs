@@ -464,13 +464,14 @@ impl DWFALite {
 
     /// This will return the set of candidate extensions that do not require increasing the edit distance.
     /// It also includes how many times that character was counted in the event of multiple possible extension points.
+    /// Only active alignments nominate candidates.
     /// # Arguments
     /// * `baseline_seq` - the baseline sequence, theoretically fixed
     /// * `other_seq` - the other sequence, typically getting updates
     #[allow(dead_code)]
     #[deprecated(note = "use `extension_symbols` instead")]
     pub(super) fn get_extension_candidates(&self, baseline_seq: &[u8], other_seq: &[u8]) -> HashMap<u8, usize> {
-        if self.state == DWFALiteState::ExceededEditDistanceLimit {
+        if self.state != DWFALiteState::Active {
             return Default::default();
         }
         let mut ret: HashMap<u8, usize> = Default::default();
@@ -491,12 +492,13 @@ impl DWFALite {
     /// Appends the symbols that extend this DWFA without increasing the edit distance to `symbols`.
     /// The order is the wavefront order, which is also the insertion order of `get_extension_candidates()`.
     /// A symbol is repeated once for each diagonal that nominates it.
+    /// Inactive alignments leave the output buffer unchanged.
     /// # Arguments
     /// * `baseline_seq` - the baseline sequence, theoretically fixed
     /// * `other_seq` - the other sequence, typically getting updates
     /// * `symbols` - output buffer; existing contents are kept
     pub(crate) fn extension_symbols(&self, baseline_seq: &[u8], other_seq: &[u8], symbols: &mut Vec<u8>) {
-        if self.state == DWFALiteState::ExceededEditDistanceLimit {
+        if self.state != DWFALiteState::Active {
             return;
         }
         match self.frontier {
@@ -526,6 +528,7 @@ impl DWFALite {
 
     /// Adds the vote of this DWFA to `votes`, like `votes.add()` with the output of `extension_symbols()`.
     /// Most DWFAs have one diagonal at the frontier, and those vote without the `symbols` buffer.
+    /// Inactive alignments leave existing votes unchanged.
     /// # Arguments
     /// * `baseline_seq` - the baseline sequence, theoretically fixed
     /// * `other_seq` - the other sequence, typically getting updates
@@ -534,7 +537,7 @@ impl DWFALite {
     /// * `scratch` - buffers for a DWFA with more than one frontier diagonal
     #[inline(always)]
     pub(crate) fn vote(&self, baseline_seq: &[u8], other_seq: &[u8], weight: f64, votes: &mut ExtensionVotes, scratch: &mut VoteScratch) {
-        if self.state == DWFALiteState::ExceededEditDistanceLimit {
+        if self.state != DWFALiteState::Active {
             return;
         }
         // try to short-circuit the extension symbols computation
@@ -778,6 +781,58 @@ mod tests {
             *counts.entry(s).or_insert(0) += 1;
         }
         assert_eq!(counts, dwfa.get_extension_candidates(baseline, other));
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_finalized_alignments_do_not_nominate_candidates() {
+        let baseline = b"AC";
+        let other = b"C";
+        let mut dwfa = DWFALite::default();
+        dwfa.update(baseline, other).unwrap();
+        assert_eq!(dwfa.get_extension_candidates(baseline, other), HashMap::from_iter([(b'A', 1), (b'C', 1)]));
+
+        dwfa.finalize(baseline, other).unwrap();
+        assert_eq!(dwfa.state(), DWFALiteState::Finalized);
+        assert!(dwfa.get_extension_candidates(baseline, other).is_empty());
+    }
+
+    #[test]
+    fn test_finalized_alignments_preserve_symbol_buffer() {
+        let baseline = b"AC";
+        let other = b"C";
+        let mut dwfa = DWFALite::default();
+        dwfa.update(baseline, other).unwrap();
+        let mut symbols = vec![0, 255];
+        dwfa.extension_symbols(baseline, other, &mut symbols);
+        assert_eq!(symbols, vec![0, 255, b'C', b'A']);
+
+        dwfa.finalize(baseline, other).unwrap();
+        assert_eq!(dwfa.state(), DWFALiteState::Finalized);
+        dwfa.extension_symbols(baseline, other, &mut symbols);
+        assert_eq!(symbols, vec![0, 255, b'C', b'A']);
+    }
+
+    #[test]
+    fn test_finalized_alignments_preserve_existing_votes() {
+        let baseline = b"AC";
+        let other = b"CA";
+        let mut dwfa = DWFALite::new(dwfa_config(None, true, None));
+        dwfa.update(baseline, other).unwrap();
+        let mut votes = ExtensionVotes::default();
+        votes.add_single(b'G', 0.25);
+        let mut scratch = VoteScratch::default();
+        dwfa.vote(baseline, other, 0.5, &mut votes, &mut scratch);
+        let mut candidates = vec![];
+        let expected = HashMap::from_iter([(b'G', 0.25), (b'C', 0.5)]);
+        votes.candidates(None, &mut candidates);
+        assert_eq!(HashMap::from_iter(candidates.iter().copied()), expected);
+
+        dwfa.finalize(baseline, other).unwrap();
+        assert_eq!(dwfa.state(), DWFALiteState::Finalized);
+        dwfa.vote(baseline, other, 0.5, &mut votes, &mut scratch);
+        votes.candidates(None, &mut candidates);
+        assert_eq!(HashMap::from_iter(candidates.iter().copied()), expected);
     }
 
     fn dwfa_config(wildcard: Option<u8>, allow_early_termination: bool, max_edit_distance: Option<usize>) -> DWFALiteConfig {

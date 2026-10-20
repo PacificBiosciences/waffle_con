@@ -77,6 +77,8 @@ fn build_cases() -> Vec<Case> {
 }
 
 /// Runs one case and returns its result.
+/// # Arguments
+/// * `input` - the sequences and settings for one case
 fn run_case(input: &Input) -> Output {
     match input {
         Input::Consensus { min_count, dataset } => {
@@ -106,6 +108,8 @@ fn run_case(input: &Input) -> Output {
 
 /// Hashes the text of a result. A `DWFALite` is hashed through its public getters only,
 /// so that a change to its private fields does not change the digest.
+/// # Arguments
+/// * `output` - the result of one case
 fn digest(output: &Output) -> u64 {
     let text = match output {
         Output::Consensus(result) => format!("{result:?}"),

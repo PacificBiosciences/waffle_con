@@ -117,6 +117,8 @@ impl Clone for DWFALite {
     }
 
     /// Reuses the wavefront allocation of `self`.
+    /// # Arguments
+    /// * `source` - the DWFA to copy
     fn clone_from(&mut self, source: &Self) {
         self.wavefront.clear();
         self.wavefront.reserve(source.wavefront.len() + CLONE_SPARE_DIAGONALS);
@@ -181,6 +183,7 @@ impl DWFALite {
     /// * If this function is called after `finalize()` has been called.
     #[inline]
     pub fn update(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Result<usize, Box<dyn std::error::Error>> {
+        // try the fast path, fallback to update_general if it fails
         match self.advance_single_frontier(baseline_seq, other_seq) {
             Some(_) => Ok(self.edit_distance),
             None => self.update_general(baseline_seq, other_seq),
@@ -189,6 +192,12 @@ impl DWFALite {
 
     /// `update()` and then `vote()`. When the fast path of `update()` applies, the vote is the next baseline symbol
     /// on the frontier diagonal, so it needs no second look at the wavefront.
+    /// # Arguments
+    /// * `baseline_seq` - the baseline sequence, theoretically fixed
+    /// * `other_seq` - the other sequence, typically getting updates
+    /// * `weight` - the total weight of this DWFA's vote
+    /// * `votes` - the votes of all DWFAs so far
+    /// * `scratch` - buffers for a DWFA with more than one frontier diagonal
     /// # Errors
     /// * If this function is called after `finalize()` has been called.
     #[inline(always)]
@@ -197,12 +206,14 @@ impl DWFALite {
     ) -> Result<usize, Box<dyn std::error::Error>> {
         match self.advance_single_frontier(baseline_seq, other_seq) {
             Some(next_offset) => {
+                // single wavefront case, just add weight once
                 if let Some(&symbol) = baseline_seq.get(next_offset) {
                     votes.add_single(symbol, weight);
                 }
                 Ok(self.edit_distance)
             },
             None => {
+                // general case, we may have multiple frontier wavefronts
                 let edit_distance = self.update_general(baseline_seq, other_seq)?;
                 self.vote(baseline_seq, other_seq, weight, votes, scratch);
                 Ok(edit_distance)
@@ -215,24 +226,38 @@ impl DWFALite {
     /// one step, and nothing else changes. It returns the new baseline offset of the diagonal.
     /// In all other cases, this returns `None` and changes nothing.
     /// For speed, it only handles a frontier diagonal in the low 64 bits of the bitmask.
+    /// # Arguments
+    /// * `baseline_seq` - the baseline sequence, theoretically fixed
+    /// * `other_seq` - the other sequence, typically getting updates
     #[inline(always)]
     fn advance_single_frontier(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Option<usize> {
+        // the last update must have reached the end of `other_seq`, so that the frontier diagonal holds the maximum
         let bits = self.frontier?;
         let low_bits = bits as u64;
-        // the last update must have reached the end of `other_seq`, so that the frontier diagonal holds the maximum
+
+        // TODO: we could use u128 short circuiting here, but initial tests showed it was slightly slower
+        //       could be worth revisiting in the future
+
+        // short circuit if our assumptions are violated
         if self.state != DWFALiteState::Active || (bits >> 64) != 0 || !low_bits.is_power_of_two() ||
             other_seq.len() != self.extended_len + 1 || self.offset + self.max_wavefront != self.extended_len {
+            // if any condition is violated, we have to take the general path
             return None;
         }
-        let i = low_bits.trailing_zeros() as usize;
         // the frontier diagonal is at `extended_len`, so it holds the cached maximum; this saves a dependent load
+        let i = low_bits.trailing_zeros() as usize;
         let d = self.max_wavefront;
         debug_assert_eq!(d, self.wavefront[i]);
+
+        // check that the new symbol matches the frontier diagonal
         let baseline_offset = d + self.edit_distance - i;
         let symbol = *baseline_seq.get(baseline_offset)?;
         if symbol != other_seq[d + self.offset] && self.config.wildcard != Some(symbol) {
+            // it doesn't, so we have to take the general path
             return None;
         }
+
+        // update the wavefront and cached maxima
         self.wavefront[i] = d + 1;
         self.max_wavefront = d + 1;
         self.max_baseline = self.max_baseline.max(baseline_offset + 1);
@@ -241,6 +266,11 @@ impl DWFALite {
     }
 
     /// `update()` for all cases.
+    /// # Arguments
+    /// * `baseline_seq` - the baseline sequence, theoretically fixed
+    /// * `other_seq` - the other sequence, typically getting updates
+    /// # Errors
+    /// * If this function is called after `finalize()` has been called.
     #[inline(never)]
     fn update_general(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Result<usize, Box<dyn std::error::Error>> {
         match self.state {
@@ -307,10 +337,15 @@ impl DWFALite {
                 // only the frontier diagonals can move; values only grow, so the cached maxima stay valid lower bounds
                 let mut new_bits: u128 = 0;
                 while bits != 0 {
+                    // get the index of the lowest set bit, and unset it
                     let i = bits.trailing_zeros() as usize;
                     bits &= bits - 1;
+
+                    // get the diagonal and extend it by the match length
                     let d = &mut self.wavefront[i];
                     *d += match_length(baseline_seq, other_seq, *d + edit_distance - i, *d + offset, wildcard);
+
+                    // if the diagonal is at the end, then it is still frontier
                     if *d + offset == other_len {
                         new_bits |= 1 << i;
                     }
@@ -319,11 +354,14 @@ impl DWFALite {
                 }
                 self.frontier = Some(new_bits);
             },
+            // general case when the frontier cannot short circuit
             _ => {
                 let frontier = if other_len < self.extended_len { 0 } else { self.extended_len };
                 let mut max_wavefront = 0;
                 let mut max_baseline = 0;
                 let mut new_bits: u128 = 0;
+
+                // go through every diagonal and extend it
                 for (i, d) in self.wavefront.iter_mut().enumerate() {
                     if *d + offset >= frontier {
                         *d += match_length(baseline_seq, other_seq, *d + edit_distance - i, *d + offset, wildcard);
@@ -630,11 +668,18 @@ impl ExtensionVotes {
     }
 
     /// Adds the vote of a DWFA that nominates one symbol, the same as `add(&[symbol], weight)`.
+    /// # Arguments
+    /// * `symbol` - the symbol this DWFA nominates
+    /// * `weight` - the total weight of this DWFA's vote
     #[inline]
     pub(crate) fn add_single(&mut self, symbol: u8, weight: f64) {
         self.add_vote(symbol, weight);
     }
 
+    /// Adds one amount to the total for a symbol.
+    /// # Arguments
+    /// * `symbol` - the symbol receiving the vote
+    /// * `vote` - the amount to add
     #[inline]
     fn add_vote(&mut self, symbol: u8, vote: f64) {
         match self.votes.iter_mut().find(|(s, _)| *s == symbol) {
@@ -709,23 +754,32 @@ pub(crate) struct MapOrders {
 
 impl MapOrders {
     /// Packs up to `MAX_CACHED_KEYS` keys and their count into one `u64`
+    /// # Arguments
+    /// * `keys` - the distinct keys, in insertion order
     fn pack(keys: &[u8]) -> u64 {
         debug_assert!(keys.len() <= MAX_CACHED_KEYS);
         keys.iter().enumerate().fold(keys.len() as u64, |packed, (index, &key)| packed | (u64::from(key) << (8 * (index + 1))))
     }
 
     /// Packs an iteration order: byte `position` is the index into the keys of the key at that position
+    /// # Arguments
+    /// * `indices` - the index of each key, in iteration order
     fn pack_order(indices: impl Iterator<Item = usize>) -> u64 {
         indices.enumerate().fold(0, |order, (position, index)| order | ((index as u64) << (8 * position)))
     }
 
     /// The index into the keys of the key at `position` in a packed order
+    /// # Arguments
+    /// * `order` - a packed iteration order
+    /// * `position` - the position in that order
     #[inline(always)]
     fn index_at(order: u64, position: usize) -> usize {
         ((order >> (8 * position)) & 0xff) as usize
     }
 
     /// The packed iteration order of a new `HashMap<u8, f64>` after `insert()` of the distinct `keys` in order
+    /// # Arguments
+    /// * `keys` - the distinct keys, in insertion order
     fn inserted_order(&mut self, keys: &[u8]) -> u64 {
         *self.inserted.entry(Self::pack(keys)).or_insert_with(|| {
             let mut map: HashMap<u8, f64> = Default::default();
@@ -737,6 +791,8 @@ impl MapOrders {
     }
 
     /// The packed iteration order of a new `HashMap<u8, usize>` after `entry()` of the distinct `keys` in order
+    /// # Arguments
+    /// * `keys` - the distinct keys, in insertion order
     fn counted_order(&mut self, keys: &[u8]) -> u64 {
         *self.counted.entry(Self::pack(keys)).or_insert_with(|| {
             let mut map: HashMap<u8, usize> = Default::default();
@@ -776,12 +832,20 @@ impl VoteBuffers {
     }
 
     /// Adds the vote of one DWFA, see `DWFALite::vote()`.
+    /// # Arguments
+    /// * `dwfa` - the DWFA casting the vote
+    /// * `baseline_seq` - the baseline sequence, theoretically fixed
+    /// * `other_seq` - the other sequence, typically getting updates
+    /// * `weight` - the total weight of this DWFA's vote
     #[inline]
     pub(crate) fn add(&mut self, dwfa: &DWFALite, baseline_seq: &[u8], other_seq: &[u8], weight: f64) {
         dwfa.vote(baseline_seq, other_seq, weight, &mut self.votes, &mut self.scratch);
     }
 
     /// Writes the candidates into `out`, see `ExtensionVotes::candidates()`.
+    /// # Arguments
+    /// * `wildcard` - an optional wildcard symbol
+    /// * `out` - output buffer; it is cleared first
     pub(crate) fn candidates(&mut self, wildcard: Option<u8>, out: &mut Vec<(u8, f64)>) {
         self.votes.candidates(wildcard, out, &mut self.scratch.orders);
     }
@@ -812,6 +876,9 @@ impl GrownWavefront {
 /// Grows a wavefront that fits the frontier bitmask, in place, and fills `GrownWavefront::frontier`.
 /// It is filled from the end, so that `wavefront[i - 2..=i]` still holds the old values when diagonal `i` is computed.
 /// The `Vec` grows with amortized doubling, and a clone has spare capacity, so most calls do not allocate.
+/// # Arguments
+/// * `wavefront` - the wavefront to grow in place
+/// * `grower` - the sequences and edit distance for the new diagonals
 #[inline(always)]
 fn grow_wavefront(wavefront: &mut Vec<usize>, mut grower: WavefrontGrower<'_>) -> GrownWavefront {
     let old_len = wavefront.len();
@@ -841,6 +908,13 @@ fn grow_wavefront(wavefront: &mut Vec<usize>, mut grower: WavefrontGrower<'_>) -
 /// same as `grow_wavefront()`. Wide wavefronts come from large edit distances, e.g., in `finalize()`, where most
 /// diagonals are past the end of a sequence and can never extend again. A separate pass lets the gather use vector
 /// instructions, and the extension pass skips those diagonals with a well-predicted branch.
+/// # Arguments
+/// * `wavefront` - the wavefront to replace with the grown one
+/// * `baseline_seq` - the baseline sequence, theoretically fixed
+/// * `other_seq` - the other sequence, typically getting updates
+/// * `edit_distance` - the edit distance of the grown wavefront
+/// * `offset` - the offset into `other_seq` where the baseline starts
+/// * `wildcard` - an optional wildcard symbol
 fn grow_wide_wavefront(
     wavefront: &mut Vec<usize>, baseline_seq: &[u8], other_seq: &[u8], edit_distance: usize, offset: usize, wildcard: Option<u8>
 ) -> GrownWavefront {
@@ -875,6 +949,10 @@ fn grow_wide_wavefront(
 /// `i..=i + 2 * steps`: a step moves a value 0, 1, or 2 diagonals up, and a move of 1 or 2 adds one.
 /// Two sliding maxima cover the rising part (`j - i <= steps`) and the constant part (`j - i >= steps`).
 /// The rising scores `old[i] + edit_distance - i` are the baseline offsets, so they cannot underflow.
+/// # Arguments
+/// * `wavefront` - the wavefront to replace
+/// * `edit_distance` - the edit distance of `wavefront` before the growths
+/// * `steps` - how many edits to apply
 fn grow_without_matches(wavefront: &mut Vec<usize>, edit_distance: usize, steps: usize) {
     let old = std::mem::take(wavefront);
     let mut rising: VecDeque<usize> = VecDeque::new();
@@ -918,6 +996,13 @@ struct WavefrontGrower<'a> {
 }
 
 impl<'a> WavefrontGrower<'a> {
+    /// Creates a grower for one edit.
+    /// # Arguments
+    /// * `baseline_seq` - the baseline sequence, theoretically fixed
+    /// * `other_seq` - the other sequence, typically getting updates
+    /// * `edit_distance` - the edit distance of the grown wavefront
+    /// * `offset` - the offset into `other_seq` where the baseline starts
+    /// * `wildcard` - an optional wildcard symbol
     #[inline(always)]
     fn new(baseline_seq: &'a [u8], other_seq: &'a [u8], edit_distance: usize, offset: usize, wildcard: Option<u8>) -> Self {
         WavefrontGrower {
@@ -931,6 +1016,9 @@ impl<'a> WavefrontGrower<'a> {
     }
 
     /// Extends diagonal `i` from `d`, updates the cached values, and returns the extended `d`.
+    /// # Arguments
+    /// * `i` - the index of the diagonal in the grown wavefront
+    /// * `d` - the distance into `other_seq` before extending
     #[inline(always)]
     fn visit(&mut self, i: usize, d: usize) -> usize {
         let d = d + match_length(self.baseline_seq, self.other_seq, d + self.edit_distance - i, d + self.offset, self.wildcard);
@@ -945,6 +1033,12 @@ impl<'a> WavefrontGrower<'a> {
 
 /// Returns how many symbols match from `baseline_seq[baseline_offset..]` and `other_seq[other_offset..]`.
 /// A baseline symbol equal to `wildcard` matches anything.
+/// # Arguments
+/// * `baseline_seq` - the baseline sequence, theoretically fixed
+/// * `other_seq` - the other sequence, typically getting updates
+/// * `baseline_offset` - the first baseline index to compare
+/// * `other_offset` - the first other index to compare
+/// * `wildcard` - an optional wildcard symbol; a baseline symbol equal to it matches anything
 #[inline]
 fn match_length(baseline_seq: &[u8], other_seq: &[u8], baseline_offset: usize, other_offset: usize, wildcard: Option<u8>) -> usize {
     let (Some(baseline), Some(other)) = (baseline_seq.get(baseline_offset..), other_seq.get(other_offset..)) else {
@@ -959,6 +1053,9 @@ fn match_length(baseline_seq: &[u8], other_seq: &[u8], baseline_offset: usize, o
 }
 
 /// Returns the length of the common prefix of `a` and `b`, comparing 8 bytes at a time.
+/// # Arguments
+/// * `a` - the first sequence
+/// * `b` - the second sequence
 #[inline]
 fn common_prefix_length(a: &[u8], b: &[u8]) -> usize {
     let n = a.len().min(b.len());
@@ -1048,6 +1145,10 @@ mod tests {
     }
 
     /// Edit-distance DP table of `baseline` (rows) against `other` (columns); a baseline `wildcard` matches anything.
+    /// # Arguments
+    /// * `baseline` - the baseline sequence, one row per symbol
+    /// * `other` - the other sequence, one column per symbol
+    /// * `wildcard` - an optional wildcard symbol; a baseline symbol equal to it matches anything
     fn reference_table(baseline: &[u8], other: &[u8], wildcard: Option<u8>) -> Vec<Vec<usize>> {
         let mut table = vec![vec![0; other.len() + 1]; baseline.len() + 1];
         for (k, row) in table.iter_mut().enumerate() {
@@ -1115,6 +1216,10 @@ mod tests {
 
     /// The wavefront algorithm before the frontier and growth changes: grow by scattering into a zeroed wavefront,
     /// then extend every diagonal one symbol at a time.
+    /// # Arguments
+    /// * `baseline` - the baseline sequence, theoretically fixed
+    /// * `other` - the other sequence
+    /// * `wildcard` - an optional wildcard symbol; a baseline symbol equal to it matches anything
     fn reference_wavefront(baseline: &[u8], other: &[u8], wildcard: Option<u8>) -> (usize, Vec<usize>, usize) {
         let extend = |wavefront: &mut Vec<usize>, ed: usize| {
             for (i, d) in wavefront.iter_mut().enumerate() {

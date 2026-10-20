@@ -904,6 +904,8 @@ impl Clone for DualConsensusNode {
     }
 
     /// Reuses the buffers of `self`, down to the DWFA wavefronts; see `NodePool`.
+    /// # Arguments
+    /// * `source` - the node to copy
     fn clone_from(&mut self, source: &Self) {
         self.is_dual = source.is_dual;
         self.is_con1_locked = source.is_con1_locked;
@@ -1402,6 +1404,9 @@ impl DualConsensusNode {
     }
 
     /// `reached_all_end()`, but without a pass over the reads when no DWFA can be at its end
+    /// # Arguments
+    /// * `baseline_sequences` - the sequences that are fixed that we want the consensus of
+    /// * `require_all` - if True, requires *all* of the sequences to be at their end in at least one of the consensuses (this is useful for allow_early_termination)
     fn reached_all_end_quick(&self, baseline_sequences: &[&[u8]], require_all: bool) -> bool {
         // without `require_all`, a read must have a DWFA at its end
         if !require_all && !self.maybe_at_end1 && !self.maybe_at_end2 {
@@ -1411,6 +1416,10 @@ impl DualConsensusNode {
     }
 
     /// `reached_consensus_end()`, but without a pass over the reads when no DWFA of the consensus can be at its end
+    /// # Arguments
+    /// * `baseline_sequences` - the sequences that are fixed that we want the consensus of
+    /// * `is_consensus1` - if True, this will check consensus1 DWFAs, otherwise it checks those for consensus2
+    /// * `require_all` - if True, this requires all active DWFAs to be at the end
     fn reached_consensus_end_quick(&self, baseline_sequences: &[&[u8]], is_consensus1: bool, require_all: bool) -> bool {
         // without `require_all`, an active DWFA of the consensus must be at its end
         let maybe_at_end = if is_consensus1 { self.maybe_at_end1 } else { self.maybe_at_end2 };

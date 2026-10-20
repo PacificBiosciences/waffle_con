@@ -436,6 +436,8 @@ struct StepContext {
 
 impl StepContext {
     /// The cost of one DWFA with this edit distance
+    /// # Arguments
+    /// * `edit_distance` - the edit distance of one DWFA
     #[inline(always)]
     fn cost(&self, edit_distance: usize) -> usize {
         match self.consensus_cost {
@@ -576,6 +578,7 @@ impl ConsensusNode {
     /// * `symbol` - the symbol to extend each DWFA with
     /// * `context` - the summary settings
     /// # Errors
+    /// * `baseline_sequences` - the sequences that are fixed that we want the consensus of
     /// * if any of the extensions fail
     fn push(&mut self, baseline_sequences: &[&[u8]], symbol: u8, context: &mut StepContext) -> Result<(), Box<dyn std::error::Error>> {
         self.consensus.push(symbol);
@@ -604,6 +607,7 @@ impl ConsensusNode {
 
     /// Computes the summary without a push, e.g., for the root node or after an activation
     /// # Arguments
+    /// * `baseline_sequences` - the sequences that are fixed that we want the consensus of
     /// * `context` - the summary settings
     fn summarize(&mut self, baseline_sequences: &[&[u8]], context: &mut StepContext) {
         let votes = &mut self.summary.votes;

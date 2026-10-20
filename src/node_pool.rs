@@ -16,6 +16,8 @@ impl<T: Clone> NodePool<T> {
     }
 
     /// Returns a clone of `source`. It is built in a recycled node when the pool has one.
+    /// # Arguments
+    /// * `source` - the node to clone
     pub(crate) fn clone_node(&mut self, source: &T) -> T {
         match self.nodes.pop() {
             Some(mut node) => {
@@ -27,6 +29,8 @@ impl<T: Clone> NodePool<T> {
     }
 
     /// Keeps `node` for a later clone.
+    /// # Arguments
+    /// * `node` - the node to keep
     pub(crate) fn recycle(&mut self, node: T) {
         if self.nodes.len() < MAX_POOLED_NODES {
             self.nodes.push(node);

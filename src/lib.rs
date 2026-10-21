@@ -47,6 +47,8 @@ pub mod dynamic_wfa;
 pub mod example_gen;
 /// Main functionality for a multiple-consensus component
 pub mod multi_consensus;
+/// Recycles search nodes, so that clones can reuse their buffers
+mod node_pool;
 /// Utility for tracking a pqueue without force deleting items
 pub mod pqueue_tracker;
 /// Search heap that caches node priority on every push

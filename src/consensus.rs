@@ -33,7 +33,7 @@ use simple_error::{bail, SimpleError};
 use std::cmp::{Ordering, Reverse};
 
 use crate::cdwfa_config::{CdwfaConfig, ConsensusCost};
-use crate::dynamic_wfa::{DWFALite, DWFALiteState};
+use crate::dynamic_wfa::{DWFALite, DWFALiteState, ExtensionVotes, VoteScratch};
 use crate::pqueue_tracker::PQueueTracker;
 use crate::priority_queue::{CachePriority, PriorityQueue};
 
@@ -242,7 +242,14 @@ impl<'a> ConsensusDWFA<'a> {
         let initial_size = self.sequences.iter().map(|s| s.len()).max().unwrap();
         let mut pqueue_tracker = PQueueTracker::with_capacity(initial_size, max_capacity_per_size);
 
-        let initial_node = ConsensusNode::new_root_node(&self.sequences, &offsets, &self.config)?;
+        // settings and a vote buffer shared by `push()` and `summarize()`
+        let mut step_context = StepContext {
+            require_all: self.config.allow_early_termination,
+            consensus_cost: self.config.consensus_cost,
+            scratch: VoteScratch::default(),
+        };
+
+        let initial_node = ConsensusNode::new_root_node(&self.sequences, &offsets, &self.config, &mut step_context)?;
 
         // Max-heap ordered by queued priority: lower cost, then longer consensus, then earlier tie-breaker.
         let mut pqueue = PriorityQueue::new(self.consensus_cost());
@@ -250,6 +257,10 @@ impl<'a> ConsensusDWFA<'a> {
         pqueue.push(initial_node);
 
         let mut ret = vec![];
+
+        // buffers that each search step reuses
+        let mut extension_candidates: Vec<(u8, f64)> = vec![];
+        let mut passing_candidates: Vec<u8> = vec![];
 
         // the way this will work is that we will eventually find one or more answers and anything worse will get drained off until no possibilities remain
         while !pqueue.is_empty() {
@@ -283,7 +294,7 @@ impl<'a> ConsensusDWFA<'a> {
             pqueue_tracker.process(top_len)?;
 
             // now check if this node has reached the end
-            if top_node.reached_end(&self.sequences, self.config.allow_early_termination) {
+            if top_node.summary.reached_end {
                 // this node *might* be done, we need to finalize it to be sure
                 // we also need to do it in a clone since it might not be finalized and we need to keep extending
                 let mut finalized_node = top_node.clone();
@@ -313,8 +324,9 @@ impl<'a> ConsensusDWFA<'a> {
 
             // this fetches the list of options according to the WFA so far
             // NOTE: this CAN include the wildcard, but only if the wildcard is the only character
-            let extension_candidates = top_node.get_extension_candidates(&self.sequences, self.config.wildcard);
-            let max_observed = extension_candidates.values().cloned().max_by(|a, b| a.total_cmp(b))
+            // with 2+ candidates, the wildcard is removed, so something is left over
+            top_node.candidates(self.config.wildcard, &mut extension_candidates);
+            let max_observed = extension_candidates.iter().map(|&(_symbol, count)| count).max_by(|a, b| a.total_cmp(b))
                 // if no observation, then just use min count
                 .unwrap_or(self.config.min_count as f64);
             
@@ -323,38 +335,29 @@ impl<'a> ConsensusDWFA<'a> {
             trace!("\tcandidates = {:?}", extension_candidates);
 
             // pull out the full list of viable candidates
-            let passing_candidates: Vec<u8> = extension_candidates.into_iter()
-                .filter_map(|(symbol, count)| {
-                    if count >= active_threshold {
-                        Some(symbol)
-                    } else {
-                        None
-                    }
-                }).collect();
-            
-            let mut new_nodes = vec![];
-            if passing_candidates.is_empty() {
-                if top_len < max_activate {
-                    bail!("Encountered coverage gap: consensus is length {} with no candidates, but sequences activate at {}", top_len, max_activate);
-                } else {
-                    // no extensions remain, should just happen at the end
-                }
-            } else if passing_candidates.len() == 1 {
-                // we have only one extension, we can extend in place without cloning
-                let mut new_node = top_node;
-                new_node.push(&self.sequences, passing_candidates[0])?;
-                new_nodes.push(new_node);
-            } else {
-                // we have 2+ viable, we have to clone them
-                for symbol in passing_candidates.into_iter() {
-                    let mut new_node = top_node.clone();
-                    new_node.push(&self.sequences, symbol)?;
-                    new_nodes.push(new_node);
-                }
-            }
+            passing_candidates.clear();
+            passing_candidates.extend(extension_candidates.iter()
+                .filter(|&&(_symbol, count)| count >= active_threshold)
+                .map(|&(symbol, _count)| symbol));
 
-            // for each need node, do any activations and then add it to the queue
-            for mut new_node in new_nodes.into_iter() {
+            if passing_candidates.is_empty() && top_len < max_activate {
+                bail!("Encountered coverage gap: consensus is length {} with no candidates, but sequences activate at {}", top_len, max_activate);
+            }
+            // with no candidates, no extensions remain; this should just happen at the end
+
+            // each child extends a clone; the last child takes `top_node` instead of a clone
+            // one candidate extends in place without cloning
+            // `top_node` is placed into an Option to pass the borrow checker
+            let num_children = passing_candidates.len();
+            let mut parent = Some(top_node);
+            for (child_index, &symbol) in passing_candidates.iter().enumerate() {
+                let mut new_node = if child_index + 1 == num_children {
+                    parent.take().expect("parent is only taken on the last child")
+                } else {
+                    parent.as_ref().unwrap().clone()
+                };
+                new_node.push(&self.sequences, symbol, &mut step_context)?;
+
                 // check if we need to activate any strings
                 let opt_activate_list = activate_points.get(&new_node.consensus().len());
                 if let Some(activate_list) = opt_activate_list {
@@ -362,6 +365,8 @@ impl<'a> ConsensusDWFA<'a> {
                     for &seq_index in activate_list.iter() {
                         new_node.activate_sequence(self.sequences[seq_index], seq_index, offset_window, offset_compare_length, &self.config)?;
                     }
+                    // summarize once after every read at this length has been activated
+                    new_node.summarize(&self.sequences, &mut step_context);
                 }
 
                 // get the new cost and put it in the queue
@@ -396,8 +401,67 @@ impl<'a> ConsensusDWFA<'a> {
     }
 }
 
+/// Cached state for the next search step.
+/// `push()` refreshes it for each extension.
+/// `new_root_node()` refreshes it through `summarize()`.
+/// After one or more activations, the caller refreshes it once with `summarize()`.
+/// A node does not change once it enters the search heap, so this cache remains valid.
+#[derive(Clone, Debug, Default)]
+struct StepSummary {
+    /// The extension votes of all active DWFAs, each with weight 1.0.
+    /// Symbols are ordered by their first vote as the reads are traversed.
+    votes: ExtensionVotes,
+    /// Whether this node may be finalized. When `StepContext::require_all` is false, any active DWFA at its
+    /// baseline end is sufficient; when true, every DWFA must be at its baseline end. An inactive DWFA is not
+    /// at the end, while a capped DWFA contributes the `require_all` value.
+    reached_end: bool,
+    /// Sum of the active DWFA costs under `StepContext::consensus_cost`.
+    total_cost: usize,
+}
+
+/// The settings of `StepSummary` and a scratch buffer, for one consensus run.
+struct StepContext {
+    /// Require every read to reach its end before finalization, as configured by `allow_early_termination`.
+    require_all: bool,
+    /// Cost model used for `StepSummary::total_cost` and priority-queue ordering.
+    consensus_cost: ConsensusCost,
+    /// Reusable workspace for collecting a DWFA's extension vote.
+    scratch: VoteScratch,
+}
+
+impl StepContext {
+    /// The cost of one DWFA with this edit distance
+    /// # Arguments
+    /// * `edit_distance` - the edit distance of one DWFA
+    #[inline(always)]
+    fn cost(&self, edit_distance: usize) -> usize {
+        match self.consensus_cost {
+            ConsensusCost::L1Distance => edit_distance,
+            ConsensusCost::L2Distance => edit_distance.pow(2)
+        }
+    }
+
+    /// Whether one DWFA counts as at the end for `StepSummary::reached_end`.
+    /// A capped read must not finish the consensus early, and must not block when every read has to finish,
+    /// so it gives the `require_all` value.
+    #[inline(always)]
+    fn at_end(&self, dwfa: &DWFALite, baseline: &[u8]) -> bool {
+        if dwfa.state() == DWFALiteState::ExceededEditDistanceLimit {
+            self.require_all
+        } else {
+            dwfa.reached_baseline_end(baseline)
+        }
+    }
+
+    /// `StepSummary::reached_end` from the any and all values over the reads
+    #[inline(always)]
+    fn reached_end(&self, any_at_end: bool, all_at_end: bool) -> bool {
+        if self.require_all { all_at_end } else { any_at_end }
+    }
+}
+
 /// Wrapper for a node containing a partial consensus as well as the DWFA tracking for that node.
-#[derive(Clone, Debug, Eq)]
+#[derive(Clone, Debug)]
 struct ConsensusNode {
     /// The consensus sequence so far
     consensus: Vec<u8>,
@@ -405,6 +469,8 @@ struct ConsensusNode {
     dwfas: Vec<Option<DWFALite>>,
     /// Rank in the search heap: lower cost, then longer consensus, then earlier tie-breaker. Set by `cache_priority`.
     queued_priority: NodePriority,
+    /// What the next search step needs from `dwfas`. Set by `push()`, `new_root_node()`, and one `summarize()` after activation.
+    summary: StepSummary,
 }
 
 // The following Eq and Ord implementations are specifically for the Binary Heap.
@@ -415,6 +481,9 @@ impl PartialEq for ConsensusNode {
         self.queued_priority == other.queued_priority
     }
 }
+
+// `PartialEq` only compares the priority, which is a total order
+impl Eq for ConsensusNode {}
 
 impl PartialOrd for ConsensusNode {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -436,10 +505,11 @@ impl ConsensusNode {
     /// * `sequences` - the baseline reads, parallel to `offsets`
     /// * `offsets` - a set of offsets into the sequences where the approximate starts are
     /// * `config` - consensus configuration
+    /// * `context` - summary settings; the returned node is already summarized
     /// # Errors
     /// * if DWFA construction fails
     /// * if `sequences` and `offsets` have different lengths
-    fn new_root_node(sequences: &[&[u8]], offsets: &[Option<usize>], config: &CdwfaConfig) -> Result<ConsensusNode, Box<dyn std::error::Error>> {
+    fn new_root_node(sequences: &[&[u8]], offsets: &[Option<usize>], config: &CdwfaConfig, context: &mut StepContext) -> Result<ConsensusNode, Box<dyn std::error::Error>> {
         if sequences.len() != offsets.len() {
             bail!("Sequence and offset counts must match.");
         }
@@ -460,20 +530,28 @@ impl ConsensusNode {
             bail!("Root consensus node has no initially active sequences.");
         }
 
-        Ok(ConsensusNode {
+        let mut node = ConsensusNode {
             consensus: vec![],
             dwfas,
             queued_priority: (Reverse(0), 0, Reverse(0)),
-        })
+            summary: StepSummary::default(),
+        };
+        node.summarize(sequences, context);
+        Ok(node)
     }
 
-    /// This will activate the DWFAs for a particular sequence.
+    /// This will activate the DWFA for a particular sequence.
+    /// 
+    /// NOTE: This does *not* summarize the node.
+    /// Users must separately call `summarize()` after activating all sequences at this consensus length.
     /// # Arguments
     /// * `sequence` - the sequence that is getting activated
     /// * `seq_index` - the sequence index, which will map to the DWFAs
     /// * `offset_window` - the window we are searching for a best match
     /// * `offset_compare_length` - the amount of bases we are comparing
     /// * `config` - consensus configuration, including wildcard, early termination, and the edit-distance cap
+    /// # Errors
+    /// * if DWFA construction or the initial update fails
     fn activate_sequence(&mut self, sequence: &[u8], seq_index: usize, offset_window: usize, offset_compare_length: usize, config: &CdwfaConfig) -> Result<(), Box<dyn std::error::Error>> {
         // make sure everything is currently inactive
         assert!(self.dwfas[seq_index].is_none());
@@ -511,19 +589,72 @@ impl ConsensusNode {
         Ok(())
     }
 
-    /// Adds a new symbol to the DWFAs
+    /// Adds a new symbol to the consensus, updates each active DWFA, and refreshes the summary.
+    /// A single next symbol returned by `update()` votes directly; otherwise the DWFA calls `vote()`.
     /// # Arguments
+    /// * `baseline_sequences` - the sequences that are fixed that we want the consensus of
     /// * `symbol` - the symbol to extend each DWFA with
+    /// * `context` - summary settings and vote scratch space
     /// # Errors
     /// * if any of the extensions fail
-    fn push(&mut self, baseline_sequences: &[&[u8]], symbol: u8) -> Result<(), Box<dyn std::error::Error>> {
+    fn push(&mut self, baseline_sequences: &[&[u8]], symbol: u8, context: &mut StepContext) -> Result<(), Box<dyn std::error::Error>> {
+        // update the consensus
         self.consensus.push(symbol);
+
+        // clear the votes in preparation for the new symbols
+        let votes = &mut self.summary.votes;
+        votes.clear();
+
+        // trackers going into the summary
+        let mut total_cost = 0;
+        let mut any_at_end = false;
+        let mut all_at_end = true;
         for (&baseline, opt_dwfa) in baseline_sequences.iter().zip(self.dwfas.iter_mut()) {
-            if let Some(dwfa) = opt_dwfa.as_mut() {
-                dwfa.update(baseline, &self.consensus)?;
-            }
+            let at_end = match opt_dwfa.as_mut() {
+                Some(dwfa) => {
+                    let (edit_distance, next_symbol) = dwfa.update(baseline, &self.consensus)?;
+                    match next_symbol {
+                        Some(symbol) => votes.add_single(symbol, 1.0),
+                        None => dwfa.vote(baseline, &self.consensus, 1.0, votes, &mut context.scratch),
+                    }
+                    total_cost += context.cost(edit_distance);
+                    context.at_end(dwfa, baseline)
+                },
+                None => false,
+            };
+            any_at_end |= at_end;
+            all_at_end &= at_end;
         }
+        self.summary.total_cost = total_cost;
+        self.summary.reached_end = context.reached_end(any_at_end, all_at_end);
         Ok(())
+    }
+
+    /// Computes votes, total cost, and `reached_end` from the current DWFAs.
+    /// Called by `new_root_node()`, and should be called after activating new sequences.
+    /// # Arguments
+    /// * `baseline_sequences` - the sequences that are fixed that we want the consensus of
+    /// * `context` - the summary settings
+    fn summarize(&mut self, baseline_sequences: &[&[u8]], context: &mut StepContext) {
+        let votes = &mut self.summary.votes;
+        votes.clear();
+        let mut total_cost = 0;
+        let mut any_at_end = false;
+        let mut all_at_end = true;
+        for (&baseline, opt_dwfa) in baseline_sequences.iter().zip(self.dwfas.iter()) {
+            let at_end = match opt_dwfa.as_ref() {
+                Some(dwfa) => {
+                    dwfa.vote(baseline, &self.consensus, 1.0, votes, &mut context.scratch);
+                    total_cost += context.cost(dwfa.edit_distance());
+                    context.at_end(dwfa, baseline)
+                },
+                None => false,
+            };
+            any_at_end |= at_end;
+            all_at_end &= at_end;
+        }
+        self.summary.total_cost = total_cost;
+        self.summary.reached_end = context.reached_end(any_at_end, all_at_end);
     }
 
     /// Finalizes all of the contained DWFAs
@@ -581,67 +712,24 @@ impl ConsensusNode {
 
     /// Returns the total score for the node
     fn total_cost(&self, consensus_cost: ConsensusCost) -> usize {
-        self.costs(consensus_cost).iter().sum()
+        // same as summing `costs()`, without the allocation; a DWFA that is not initialized costs 0
+        self.dwfas.iter()
+            .flatten()
+            .map(|d| match consensus_cost {
+                ConsensusCost::L1Distance => d.edit_distance(),
+                ConsensusCost::L2Distance => d.edit_distance().pow(2)
+            })
+            .sum()
     }
 
-    /// Returns true if any of the dwfas are at the end of their respective baseline sequences
+    /// Writes this node's extension candidates into `out`.
+    /// When there are two or more candidates, `wildcard` is removed. One candidate is kept as it is,
+    /// including when that candidate is the wildcard.
     /// # Arguments
-    /// * `baseline_sequences` - the sequences that are fixed that we want the consensus of
-    /// * `require_all` - if True, requires all of the sequences to be at their end (this is useful for allow_early_termination)
-    fn reached_end(&self, baseline_sequences: &[&[u8]], require_all: bool) -> bool {
-        let mut end_iter = baseline_sequences.iter().zip(self.dwfas.iter())
-            .map(|(&baseline, opt_dwfa)| {
-                if let Some(dwfa) = opt_dwfa.as_ref() {
-                    if dwfa.state() == DWFALiteState::ExceededEditDistanceLimit {
-                        // A capped read must not finish the consensus early, and must not block when every read has to finish.
-                        // So by returning the require_all value, we silently skip this read in either case.
-                        require_all
-                    } else {
-                        dwfa.reached_baseline_end(baseline)
-                    }
-                } else {
-                    false
-                }
-            });
-        
-        // same iterator, different check
-        if require_all {
-            end_iter.all(|b| b)
-        } else {
-            end_iter.any(|b| b)
-        }
-    }
-
-    /// Returns a hashmap of the extension candidates with their votes.
-    /// The votes are fractional if a sequence has multiple equally likely options.
-    /// Note that if 
-    /// # Arguments
-    /// * `baseline_sequences` - the sequences that are fixed that we want the consensus of
-    /// * `wildcard` - an optional wildcard character, will be removed from return set unless it is the only value in it
-    fn get_extension_candidates(&self, baseline_sequences: &[&[u8]], wildcard: Option<u8>) -> HashMap<u8, f64> {
-        let mut candidates: HashMap<u8, f64> = Default::default();
-        for (baseline_seq, opt_dwfa) in baseline_sequences.iter().zip(self.dwfas.iter()) {
-            if let Some(dwfa) = opt_dwfa.as_ref() {
-                // get the candidates and the total observation weight
-                let cand = dwfa.get_extension_candidates(baseline_seq, &self.consensus);
-                let vote_split = cand.values().sum::<usize>() as f64;
-                
-                // iterate over each candidate and scale it by the occurrences count / total weight
-                for (&c, &occ) in cand.iter() {
-                    let entry = candidates.entry(c).or_insert(0.0);
-                    *entry += occ as f64 / vote_split;
-                }
-            }
-        }
-
-        if let Some(wc) = wildcard {
-            if candidates.len() > 1 {
-                // we have 2+ candidates, we can safely remove the wildcard and have something left over
-                candidates.remove(&wc);
-            }
-        }
-
-        candidates
+    /// * `wildcard` - an optional wildcard symbol
+    /// * `out` - output buffer; it is cleared first
+    fn candidates(&self, wildcard: Option<u8>, out: &mut Vec<(u8, f64)>) {
+        self.summary.votes.candidates(wildcard, out);
     }
 
     // getters
@@ -659,8 +747,10 @@ impl CachePriority for ConsensusNode {
     /// Caches this node's search priority.
     /// Rank is 1) lowest cost, 2) consensus length, and 3) earlier tie-breaker.
     fn cache_priority(&mut self, consensus_cost: ConsensusCost, tie_breaker: u64) {
+        // the summary has the cost from the config, which the queue also uses
+        debug_assert_eq!(self.summary.total_cost, self.total_cost(consensus_cost));
         self.queued_priority = (
-            Reverse(self.total_cost(consensus_cost)),
+            Reverse(self.summary.total_cost),
             self.consensus.len(),
             Reverse(tie_breaker),
         );
@@ -674,14 +764,20 @@ mod tests {
 
     use crate::cdwfa_config::CdwfaConfigBuilder;
 
+    /// Checks that a lower cost wins, and equal costs prefer an earlier tie-breaker.
     #[test]
     fn test_heap_orders_by_priority_then_id() {
         let sequences: [&[u8]; 1] = [b""];
         let offsets = vec![None];
         let config = CdwfaConfig::default();
-        let mut earlier = ConsensusNode::new_root_node(&sequences, &offsets, &config).unwrap();
-        let mut later = ConsensusNode::new_root_node(&sequences, &offsets, &config).unwrap();
-        let mut cheaper = ConsensusNode::new_root_node(&sequences, &offsets, &config).unwrap();
+        let mut context = StepContext {
+            require_all: config.allow_early_termination,
+            consensus_cost: config.consensus_cost,
+            scratch: VoteScratch::default(),
+        };
+        let mut earlier = ConsensusNode::new_root_node(&sequences, &offsets, &config, &mut context).unwrap();
+        let mut later = ConsensusNode::new_root_node(&sequences, &offsets, &config, &mut context).unwrap();
+        let mut cheaper = ConsensusNode::new_root_node(&sequences, &offsets, &config, &mut context).unwrap();
         earlier.queued_priority = (Reverse(1), 0, Reverse(0));
         later.queued_priority = (Reverse(1), 0, Reverse(1));
         cheaper.queued_priority = (Reverse(0), 0, Reverse(2));
@@ -696,6 +792,7 @@ mod tests {
         assert_eq!(heap.pop().unwrap().queued_priority().2.0, 1);
     }
 
+    /// Checks that one exact input is returned as the consensus with score 0.
     #[test]
     fn test_single_sequence() {
         let sequence = b"ACGTACGTACGT";
@@ -715,6 +812,7 @@ mod tests {
         }]);
     }
 
+    /// Checks that two sequences one edit apart both win, ordered lexicographically.
     #[test]
     fn test_dual_sequence() {
         let sequence = b"ACGTACGTACGT";
@@ -746,6 +844,7 @@ mod tests {
         ]);
     }
 
+    /// Checks that the majority sequence is the unique consensus when one read differs by one edit.
     #[test]
     fn test_trio_sequence() {
         let sequence = b"ACGTACGTACGT";
@@ -774,6 +873,7 @@ mod tests {
         ]);
     }
 
+    /// Checks that three indel-divergent reads recover a single intermediate consensus.
     #[test]
     fn test_complicated() {
         let expected_consensus = b"ACGTACGTACGT";
@@ -802,6 +902,7 @@ mod tests {
         assert_eq!(expected_consensus, consensus[0].sequence());
     }
 
+    /// Checks that wildcard bases are ignored for the alphabet and for edit scoring.
     #[test]
     fn test_wildcards() {
         let expected_consensus = b"ACGTACGTACGT";
@@ -834,6 +935,7 @@ mod tests {
         assert_eq!(&[1, 1, 0], consensus[0].scores());
     }
 
+    /// Checks that a lone wildcard remains a candidate when every read nominates it.
     #[test]
     fn test_all_wildcards() {
         let _expected_consensus = b"ACGTACGTACGT";
@@ -867,6 +969,7 @@ mod tests {
         assert_eq!(&[1, 0, 1], consensus[0].scores());
     }
 
+    /// Checks that early termination recovers a full consensus from prefix-truncated reads.
     #[test]
     fn test_allow_early_termination_costs() {
         let expected_consensus = b"ACGT";
@@ -904,9 +1007,9 @@ mod tests {
         ]);
     }
 
+    /// Checks that offset windows place delayed starts so every read scores 0.
     #[test]
     fn test_offset_windows() {
-        // this test is _only_ for verifying that our offsets are getting correctly adjust to match
         let expected_consensus = b"ACGTACGTACGTACGT";
         let sequences = [
             // no offset
@@ -927,8 +1030,8 @@ mod tests {
                 .offset_compare_length(4) // semi-arbitrary, just needs to be short here given our seq-len
                 .build().unwrap()
         ).unwrap();
-        for (sequence, offset) in sequences.iter().zip(offsets.iter()) {
-            consensus_dwfa.add_sequence_offset(sequence, offset.clone()).unwrap();
+        for (sequence, offset) in sequences.iter().zip(offsets.iter().cloned()) {
+            consensus_dwfa.add_sequence_offset(sequence, offset).unwrap();
         }
 
         // make sure our alphabet has four symbols, ACGT
@@ -941,9 +1044,9 @@ mod tests {
         assert_eq!(&[0, 0, 0], consensus[0].scores());
     }
 
+    /// Checks that a start far past activation leaves a DWFA uninitialized and fails finalize.
     #[test]
     fn test_offset_gap_err() {
-        // this test is _only_ for verifying that our offsets are getting correctly adjust to match
         let sequences = [
             // no offset
             b"ACGTACGTACGTACGT".to_vec(),
@@ -961,8 +1064,8 @@ mod tests {
                 .offset_compare_length(4) // semi-arbitrary, just needs to be short here given our seq-len
                 .build().unwrap()
         ).unwrap();
-        for (sequence, offset) in sequences.iter().zip(offsets.iter()) {
-            consensus_dwfa.add_sequence_offset(sequence, offset.clone()).unwrap();
+        for (sequence, offset) in sequences.iter().zip(offsets.iter().cloned()) {
+            consensus_dwfa.add_sequence_offset(sequence, offset).unwrap();
         }
 
         // make sure our alphabet has four symbols, ACGT
@@ -975,6 +1078,7 @@ mod tests {
         assert_eq!(error.to_string(), "Finalize called on DWFA that was never initialized.");
     }
 
+    /// Checks that a hard edit-distance cap freezes an outlier and labels it in the result.
     #[test]
     fn test_edit_distance_cap_ignores_outlier() {
         let good = b"ACGTACGTACGT";

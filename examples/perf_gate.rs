@@ -85,6 +85,16 @@ fn build_cases() -> Vec<Case> {
             }
         }
     }
+
+    // One longer consensus test case
+    let (sl, ns, er) = (10000, 30, 0.01);
+    let min_count = (ns as u64) / 4;
+    let (_consensus, dataset) = generate_test(alphabet_size, sl, ns, er);
+    cases.push(Case {
+        label: format!("consensus_{alphabet_size}x{sl}x{ns}_{er}"),
+        input: Input::Consensus { min_count, dataset },
+    });
+
     // 4000 leaves 500 bases on either side of the largest gap.
     let (sl, er) = (4000, 0.01);
     for gap in [1000, 2000, 3000] {

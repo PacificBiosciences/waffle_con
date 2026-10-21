@@ -41,7 +41,7 @@ fn test_exact_match() {
     let mut dwfa = DWFALite::default();
     for &c in sequence.iter() {
         other_seq.push(c);
-        assert_eq!(dwfa.update(sequence, &other_seq).unwrap(), 0);
+        assert_eq!(dwfa.update(sequence, &other_seq).unwrap().0, 0);
     }
 }
 
@@ -154,7 +154,7 @@ fn test_required_finalize() {
 #[test]
 fn test_finalize_global_endpoint() {
     let mut dwfa = DWFALite::default();
-    assert_eq!(dwfa.update(b"AC", b"CA").unwrap(), 1);
+    assert_eq!(dwfa.update(b"AC", b"CA").unwrap().0, 1);
     dwfa.finalize(b"AC", b"CA").unwrap();
     assert_eq!(dwfa.edit_distance(), 2);
     assert_eq!(dwfa.state(), DWFALiteState::Finalized);
@@ -299,7 +299,7 @@ fn test_exact_match_under_edit_distance_cap() {
     let sequence = b"ACGTACGT";
     let mut dwfa = dwfa_with_consensus_cap(sequence.len(), Some(2), None, None).unwrap();
     let other = &sequence[..4];
-    assert_eq!(dwfa.update(sequence, other).unwrap(), 0);
+    assert_eq!(dwfa.update(sequence, other).unwrap().0, 0);
     assert_eq!(dwfa.get_extension_candidates(sequence, other).get(&b'A'), Some(&1));
     assert_eq!(dwfa.state(), DWFALiteState::Active);
 }
@@ -310,13 +310,13 @@ fn test_hard_edit_distance_cap() {
     let baseline = b"ACGTACGTACGT";
     let other = b"TTTTTTTTTTTT";
     let mut dwfa = dwfa_with_consensus_cap(baseline.len(), Some(3), None, None).unwrap();
-    assert_eq!(dwfa.update(baseline, other).unwrap(), 3);
+    assert_eq!(dwfa.update(baseline, other).unwrap().0, 3);
     assert_eq!(dwfa.state(), DWFALiteState::ExceededEditDistanceLimit);
     assert!(dwfa.get_extension_candidates(baseline, other).is_empty());
 
     let mut longer = other.to_vec();
     longer.push(b'A');
-    assert_eq!(dwfa.update(baseline, &longer).unwrap(), 3);
+    assert_eq!(dwfa.update(baseline, &longer).unwrap().0, 3);
     dwfa.finalize(baseline, &longer).unwrap();
     assert_eq!(dwfa.edit_distance(), 3);
     assert!(dwfa.get_extension_candidates(baseline, &longer).is_empty());
@@ -330,7 +330,7 @@ fn test_fractional_edit_distance_cap() {
     other.extend(std::iter::repeat(b'A').take(94));
     let mut dwfa = dwfa_with_consensus_cap(baseline.len(), None, Some(0.05), None).unwrap();
     assert_eq!(dwfa.max_edit_distance(), Some(5));
-    assert_eq!(dwfa.update(&baseline, &other).unwrap(), 5);
+    assert_eq!(dwfa.update(&baseline, &other).unwrap().0, 5);
     assert_eq!(dwfa.state(), DWFALiteState::ExceededEditDistanceLimit);
     assert!(dwfa.get_extension_candidates(&baseline, &other).is_empty());
 }

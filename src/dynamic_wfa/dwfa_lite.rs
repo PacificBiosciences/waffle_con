@@ -142,63 +142,41 @@ impl DWFALite {
 
     /// This is the main function to extend the WFA with a new symbol.
     /// This function will handle all of the extending and potential edit distance increases as well.
+    /// Returns tuple (`edit_distance`, `opt_next_symbol`).
+    /// `edit_distance` is the edit distance of the WFA after the update.
+    /// `opt_next_symbol` is Some if only one diagonal was extended, so the next symbol on the frontier is known.
+    /// This allows for short-circuit voting.
     /// # Arguments
     /// * `baseline_seq` - the baseline sequence, theoretically fixed
     /// * `other_seq` - the other sequence, typically getting updates
-    /// # Errors
-    /// * If this function is called after `finalize()` has been called.
-    #[inline]
-    pub fn update(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Result<usize, Box<dyn std::error::Error>> {
-        // try the fast path, fallback to update_general if it fails
-        match self.advance_single_frontier(baseline_seq, other_seq) {
-            Some(_) => Ok(self.edit_distance),
-            None => self.update_general(baseline_seq, other_seq),
-        }
-    }
-
-    /// `update()` and then `vote()`. When the fast path of `update()` applies, the vote is the next baseline symbol
-    /// on the frontier diagonal, so it needs no second look at the wavefront.
-    /// # Arguments
-    /// * `baseline_seq` - the baseline sequence, theoretically fixed
-    /// * `other_seq` - the other sequence, typically getting updates
-    /// * `weight` - the total weight of this DWFA's vote
-    /// * `votes` - the votes of all DWFAs so far
-    /// * `scratch` - buffers for a DWFA with more than one frontier diagonal
     /// # Errors
     /// * If this function is called after `finalize()` has been called.
     #[inline(always)]
-    pub(crate) fn update_and_vote(
-        &mut self, baseline_seq: &[u8], other_seq: &[u8], weight: f64, votes: &mut ExtensionVotes, scratch: &mut VoteScratch
-    ) -> Result<usize, Box<dyn std::error::Error>> {
-        match self.advance_single_frontier(baseline_seq, other_seq) {
-            Some(next_offset) => {
-                // single wavefront case, just add weight once
-                if let Some(&symbol) = baseline_seq.get(next_offset) {
-                    votes.add_single(symbol, weight);
-                }
-                Ok(self.edit_distance)
-            },
-            None => {
-                // general case, we may have multiple frontier wavefronts
-                let edit_distance = self.update_general(baseline_seq, other_seq)?;
-                self.vote(baseline_seq, other_seq, weight, votes, scratch);
-                Ok(edit_distance)
-            },
+    pub fn update(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Result<(usize, Option<u8>), Box<dyn std::error::Error>> {
+        // try the fast path, fallback to update_general if it fails
+        if let Some(next_symbol) = self.advance_single_frontier(baseline_seq, other_seq) {
+            Ok((self.edit_distance, next_symbol))
+        } else {
+            self.update_general(baseline_seq, other_seq).map(|edit_distance| (edit_distance, None))
         }
     }
 
     /// The most common case of `update()`, without the general code. It applies when one symbol was appended,
     /// exactly one diagonal is at the frontier, and that diagonal matches the new symbol. Then the diagonal moves
-    /// one step, and nothing else changes. It returns the new baseline offset of the diagonal.
-    /// In all other cases, this returns `None` and changes nothing.
+    /// one step, and nothing else changes.
+    /// Returns `None` when this path does not apply and nothing was changed.
+    /// Returns `Some` when the diagonal advanced. 
+    /// The inner value is the next baseline symbol on that diagonal if it exists, or `None` when the baseline has no further symbol (at end).
     /// For speed, it only handles a frontier diagonal in the low 64 bits of the bitmask.
     /// # Arguments
     /// * `baseline_seq` - the baseline sequence, theoretically fixed
     /// * `other_seq` - the other sequence, typically getting updates
     #[inline(always)]
-    fn advance_single_frontier(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Option<usize> {
+    fn advance_single_frontier(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Option<Option<u8>> {
         // the last update must have reached the end of `other_seq`, so that the frontier diagonal holds the maximum
-        let bits = self.frontier?;
+        let Some(bits) = self.frontier else {
+            return None;
+        };
         let low_bits = bits as u64;
 
         // TODO: we could use u128 short circuiting here, but initial tests showed it was slightly slower
@@ -220,7 +198,9 @@ impl DWFALite {
 
         // check that the new symbol matches the frontier diagonal
         let baseline_offset = d + self.edit_distance - i;
-        let symbol = *baseline_seq.get(baseline_offset)?;
+        let Some(&symbol) = baseline_seq.get(baseline_offset) else {
+            return None;
+        };
         if symbol != other_seq[d + self.offset] && self.config.wildcard != Some(symbol) {
             // it doesn't, so we have to take the general path
             return None;
@@ -232,7 +212,7 @@ impl DWFALite {
         self.max_wavefront = d + 1;
         self.max_baseline = self.max_baseline.max(baseline_offset + 1);
         self.extended_len = other_seq.len();
-        Some(baseline_offset + 1)
+        Some(baseline_seq.get(baseline_offset + 1).copied())
     }
 
     /// `update()` for all cases.
@@ -752,7 +732,7 @@ mod tests {
             let first_len = if offset > 0 { offset + 1 } else { 1 };
             for l in first_len..=other.len() {
                 let expected = (0..=baseline.len()).map(|k| table[k][l - offset]).min().unwrap();
-                assert_eq!(dwfa.update(&baseline, &other[..l]).unwrap(), expected, "trial {trial}, length {l}");
+                assert_eq!(dwfa.update(&baseline, &other[..l]).unwrap().0, expected, "trial {trial}, length {l}");
                 // clones must behave the same as the original
                 if l % 7 == 0 {
                     dwfa = dwfa.clone();
@@ -840,7 +820,7 @@ mod tests {
             assert_eq!(expected_update, (0..=baseline.len()).map(|k| table[k][other.len()]).min().unwrap(), "trial {trial}");
 
             let mut dwfa = DWFALite::new(dwfa_config(wildcard, false, None));
-            assert_eq!(dwfa.update(&baseline, &other).unwrap(), expected_update, "trial {trial}, update");
+            assert_eq!(dwfa.update(&baseline, &other).unwrap().0, expected_update, "trial {trial}, update");
             dwfa.finalize(&baseline, &other).unwrap();
             assert_eq!(dwfa.edit_distance(), expected_final, "trial {trial}, finalized");
             assert_eq!(dwfa.wavefront(), &expected_wavefront[..], "trial {trial}, wavefront");

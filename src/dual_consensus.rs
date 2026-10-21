@@ -1637,9 +1637,9 @@ mod tests {
 
     #[test]
     fn test_get_ed_weights() {
-        let vec_sequences = vec![
+        let vec_sequences = [
             b"ACGT".to_vec(),
-            b"CGTA".to_vec()
+            b"CGTA".to_vec(),
         ];
         let sequences: Vec<&[u8]> = vec_sequences.iter().map(|v| v.as_slice()).collect();
         let offsets = vec![None; sequences.len()];
@@ -2448,8 +2448,8 @@ mod tests {
                 .offset_compare_length(4) // semi-arbitrary, just needs to be short here given our seq-len
                 .build().unwrap()
         ).unwrap();
-        for (sequence, offset) in sequences.iter().zip(offsets.iter()) {
-            consensus_dwfa.add_sequence_offset(sequence, offset.clone()).unwrap();
+        for (sequence, offset) in sequences.iter().zip(offsets.iter().cloned()) {
+            consensus_dwfa.add_sequence_offset(sequence, offset).unwrap();
         }
 
         // make sure our alphabet has four symbols, ACGT
@@ -2483,8 +2483,8 @@ mod tests {
                 .offset_compare_length(4) // semi-arbitrary, just needs to be short here given our seq-len
                 .build().unwrap()
         ).unwrap();
-        for (sequence, offset) in sequences.iter().zip(offsets.iter()) {
-            consensus_dwfa.add_sequence_offset(sequence, offset.clone()).unwrap();
+        for (sequence, offset) in sequences.iter().zip(offsets.iter().cloned()) {
+            consensus_dwfa.add_sequence_offset(sequence, offset).unwrap();
         }
 
         // make sure our alphabet has four symbols, ACGT

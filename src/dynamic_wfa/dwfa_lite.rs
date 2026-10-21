@@ -174,9 +174,7 @@ impl DWFALite {
     #[inline(always)]
     fn advance_single_frontier(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Option<Option<u8>> {
         // the last update must have reached the end of `other_seq`, so that the frontier diagonal holds the maximum
-        let Some(bits) = self.frontier else {
-            return None;
-        };
+        let bits = self.frontier?;
         let low_bits = bits as u64;
 
         // TODO: we could use u128 short circuiting here, but initial tests showed it was slightly slower
@@ -198,9 +196,7 @@ impl DWFALite {
 
         // check that the new symbol matches the frontier diagonal
         let baseline_offset = d + self.edit_distance - i;
-        let Some(&symbol) = baseline_seq.get(baseline_offset) else {
-            return None;
-        };
+        let &symbol = baseline_seq.get(baseline_offset)?;
         if symbol != other_seq[d + self.offset] && self.config.wildcard != Some(symbol) {
             // it doesn't, so we have to take the general path
             return None;

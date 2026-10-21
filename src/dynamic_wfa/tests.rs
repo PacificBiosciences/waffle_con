@@ -271,7 +271,7 @@ fn test_big_early_termination() {
     // iterate, making sure everything is fine even as we go well beyond seq_23
     let mut dwfa = DWFALite::new(dwfa_config(None, true, None));
     for i in 0..c1.len() {
-        dwfa.update(seq_23.as_bytes(), c1[0..(i+1)].as_bytes()).unwrap();
+        dwfa.update(seq_23.as_bytes(), &c1.as_bytes()[0..(i + 1)]).unwrap();
         assert!(dwfa.edit_distance() <= 2);
     }
     assert_eq!(dwfa.edit_distance(), 2);
@@ -327,7 +327,7 @@ fn test_hard_edit_distance_cap() {
 fn test_fractional_edit_distance_cap() {
     let baseline = vec![b'A'; 100];
     let mut other = vec![b'T'; 6];
-    other.extend(std::iter::repeat(b'A').take(94));
+    other.extend(std::iter::repeat_n(b'A', 94));
     let mut dwfa = dwfa_with_consensus_cap(baseline.len(), None, Some(0.05), None).unwrap();
     assert_eq!(dwfa.max_edit_distance(), Some(5));
     assert_eq!(dwfa.update(&baseline, &other).unwrap().0, 5);

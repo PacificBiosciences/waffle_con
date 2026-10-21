@@ -1,26 +1,25 @@
 # Unreleased
 ## Features
 * Added optional edit-distance caps to the config so a read stops contributing once it diverges too far: a hard maximum, a fraction of the read length, and a floor on the resolved cap. By default, none of these are set, matching previous behavior. Set them to improve performance when highly divergent reads are part of the input set.
-* Single consensus results now report which reads were halted at that cap
-* Dual consensus results now report which allele each read belongs to, including reads that hit the cap on both alleles
+* Single consensus results report which reads were halted at that cap. `Consensus::assignments()` is `None` when every read was included.
+* Dual consensus results report which allele each read belongs to. A read can tie, or hit the cap on both alleles.
+* Numerous performance enhancements were incorporated. All consensus modes should run faster.
 
-## Performance
-* Replaced the search hash queue with a binary heap ordered by cached priority
-* `DWFALite` extends only the diagonals at the frontier after a push, and caches its maximum distances
-* `DWFALite::update` has a fast path for one matching frontier diagonal
-* `DWFALite` grows a wavefront in place, and a clone gets spare capacity for the next edits
-* `DWFALite::finalize` applies the remaining edits at once when no diagonal can match again
-* Consensus nodes collect their extension votes without hash maps or allocations
-* The last child of a consensus node takes the parent node instead of a clone, and the dual search reuses the buffers of dropped nodes
-* The consensus and dual consensus benchmarks are 9.9x faster than v0.4.4 (geometric mean). Equal-vote ties follow the order each symbol is first seen, so a capped search can differ from v0.4.4. Uncapped results are still sorted by sequence.
+## Bugs
+* Fixed global DWFA finalization so it requires the diagonal that reaches both sequence ends. It previously stopped when any diagonal reached the end of the baseline. Early termination still allows an unused suffix of the other sequence.
 
 ## Tests and benchmarks
 * Add independent DP and scalar-wavefront coverage for endpoint modes, caps, offsets, wildcards, update chunking, narrow/wide boundaries, and clone isolation.
 * Add public single/dual consensus regressions for finalized scores, first-seen search limits, sibling alleles, split thresholds, capped assignments, and both per-read score arrays.
-* Extend both Criterion and `perf_gate` to 30 cases with two 10 kb single-consensus workloads and a branching single-consensus workload, retaining the existing finalization cases.
+* Extend both Criterion and `perf_gate` to 31 cases with three 10 kb single-consensus workloads and a branching single-consensus workload, retaining the existing finalization cases.
 
 ## Breaking changes
 * `Consensus::new` now takes per-read assignments and returns a `Result`
+* `DualConsensus::new` takes `Vec<SequenceAssignment>` instead of `Vec<bool>`, and `is_consensus1()` is replaced by `assignments()`
+* `DWFALite::new` takes a `DWFALiteConfig` instead of a wildcard and an early-termination flag
+* `DWFALite::update` returns `(edit_distance, Option<u8>)` instead of the edit distance alone. The optional symbol is the next baseline symbol when one frontier diagonal advanced.
+* `DWFALite::get_extension_candidates` is no longer public
+* The order of tie-breaking has changed, which may lead to slightly different results when there is not a dominant symbol
 
 # v0.4.4
 ## Bugs

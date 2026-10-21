@@ -243,7 +243,7 @@ fn update_pair(
 ) {
     expected.update(baseline, other);
     assert_eq!(
-        actual.update(baseline, other).unwrap(),
+        actual.update(baseline, other).unwrap().0,
         expected.score,
         "{context}: update return value"
     );

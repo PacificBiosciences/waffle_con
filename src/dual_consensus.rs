@@ -115,6 +115,14 @@ impl PartialEq for DualConsensus {
 
 impl DualConsensus {
     /// Generic constructor for outside usage. This does not force consensus order like `from_node(...)`.
+    /// # Arguments
+    /// * `consensus1` - the first consensus
+    /// * `consensus2` - the second consensus, or `None` when only one consensus was identified
+    /// * `assignments` - one assignment per input sequence
+    /// * `scores1` - per-read score against consensus 1; `None` when that read stopped being tracked
+    /// * `scores2` - per-read score against consensus 2; `None` when that read stopped being tracked
+    /// # Errors
+    /// * if `assignments`, `scores1`, and `scores2` have different lengths
     pub fn new(
         consensus1: Consensus, consensus2: Option<Consensus>, 
         assignments: Vec<SequenceAssignment>, scores1: Vec<Option<usize>>, scores2: Vec<Option<usize>>
@@ -186,7 +194,7 @@ impl DualConsensus {
         })
     }
 
-    // Returns true if this is a dual consensus result
+    /// Returns true when a second consensus was identified.
     pub fn is_dual(&self) -> bool {
         self.consensus2.is_some()
     }
@@ -213,7 +221,7 @@ impl DualConsensus {
     }
 }
 
-/// Core utility that will generate a consensus sequence using the DWFA approach.
+/// Core utility that generates one or two consensus sequences using the DWFA approach.
 /// For now, it will assume that all sequences are full length representations
 #[derive(Debug, Default)]
 pub struct DualConsensusDWFA<'a>  {
@@ -228,7 +236,7 @@ pub struct DualConsensusDWFA<'a>  {
 }
 
 impl<'a> DualConsensusDWFA<'a> {
-    /// Creates a new instance of ConsensusDWFA with the specified config.
+    /// Creates a new instance of DualConsensusDWFA with the specified config.
     /// # Arguments
     /// * `config` - the type of consensus score we want to use
     /// # Errors
@@ -249,7 +257,7 @@ impl<'a> DualConsensusDWFA<'a> {
         self.add_sequence_offset(sequence, None)
     }
 
-    /// Adds a new sequence to the list with no offset.
+    /// Adds a new sequence and the last consensus offset where it may start.
     /// # Arguments
     /// * `sequence` - the new sequence to add
     /// * `last_offset` - an optional offset into the consensus that is the last allowed offset for the sequence to start
@@ -271,7 +279,7 @@ impl<'a> DualConsensusDWFA<'a> {
         Ok(())
     }
 
-    // The core function that gets called after adding all the sequences we care about
+    /// The core function that gets called after adding all the sequences we care about.
     /// # Errors
     /// * if the DWFA throws errors
     pub fn consensus(&self) -> Result<Vec<DualConsensus>, Box<dyn std::error::Error>> {
@@ -851,7 +859,6 @@ impl<'a> DualConsensusDWFA<'a> {
     }
 }
 
-/// Wrapper for a node containing a partial consensus as well as the DWFA tracking for that node.
 /// One child of a non-dual node, in the order the children are queued.
 #[derive(Clone, Copy, Debug)]
 enum NodeExtension {
@@ -861,6 +868,7 @@ enum NodeExtension {
     Dual(u8, u8),
 }
 
+/// Wrapper for a node containing a partial consensus as well as the DWFA tracking for that node.
 #[derive(Debug, Eq)]
 struct DualConsensusNode {
     /// if True, then this node is tracking two consensuses
@@ -1613,6 +1621,7 @@ mod tests {
     use crate::cdwfa_config::CdwfaConfigBuilder;
 
     // first some more targeted tests
+    /// Checks that a lower cost wins, and equal costs prefer an earlier tie-breaker.
     #[test]
     fn test_heap_orders_by_priority_then_id() {
         let sequences: [&[u8]; 1] = [b""];
@@ -1635,6 +1644,7 @@ mod tests {
         assert_eq!(heap.pop().unwrap().queued_priority().2.0, 1);
     }
 
+    /// Checks that edit-distance weights split a read between the two alleles, and the unweighted mode gives the better allele full weight.
     #[test]
     fn test_get_ed_weights() {
         let vec_sequences = [
@@ -1773,6 +1783,7 @@ mod tests {
         assert_eq!(consensus, vec![expected_consensus]);
     }
 
+    /// Checks that one exact input is returned as a single consensus with score 0.
     #[test_log::test]
     fn test_single_sequence() {
         // the sequence
@@ -1800,6 +1811,7 @@ mod tests {
         }]);
     }
 
+    /// Checks that the majority sequence is the unique consensus when one read differs by one edit.
     #[test]
     fn test_trio_sequence() {
         let sequence = b"ACGTACGTACGT";
@@ -1833,6 +1845,7 @@ mod tests {
         }]);
     }
 
+    /// Checks that three indel-divergent reads recover a single intermediate consensus.
     #[test]
     fn test_complicated() {
         let expected_consensus = b"ACGTACGTACGT";
@@ -1868,6 +1881,7 @@ mod tests {
         }]);
     }
 
+    /// Checks that wildcard bases are ignored for the alphabet and for edit scoring.
     #[test]
     fn test_wildcards() {
         let expected_consensus = b"ACGTACGTACGT";
@@ -1906,6 +1920,7 @@ mod tests {
         }]);
     }
 
+    /// Checks that a lone wildcard remains a candidate when every read nominates it.
     #[test]
     fn test_all_wildcards() {
         let _expected_consensus = b"ACGTACGTACGT";
@@ -1945,6 +1960,7 @@ mod tests {
         }]);
     }
 
+    /// Checks that two sequences one edit apart become the two alleles, each with score 0.
     #[test]
     fn test_dual_sequence() {
         let sequence     = b"ACGT";
@@ -1972,6 +1988,7 @@ mod tests {
         }]);
     }
 
+    /// Checks that an outlier past the cap on both alleles is labeled `EditDistanceLimit` and omitted from both score lists.
     #[test]
     fn test_edit_distance_limit_on_both_alleles() {
         let allele1 = b"AAAAAAAA";
@@ -2005,7 +2022,7 @@ mod tests {
         assert_eq!(consensus[0].consensus2().unwrap().scores(), &[0, 0]);
     }
 
-    /// Tests the case where we have one solid consensus and one outlier read
+    /// Checks that a hard cap labels an outlier without splitting when the other reads agree.
     #[test]
     fn test_edit_distance_limit_without_split() {
         let good = b"ACGTACGTACGT";
@@ -2037,6 +2054,7 @@ mod tests {
         assert_eq!(consensus[0].scores1()[5], Some(3));
     }
 
+    /// Checks that a substitution plus a trailing base still splits into two zero-cost alleles.
     #[test]
     fn test_dual_unequal_001() {
         let sequence     = b"ACGT";
@@ -2064,6 +2082,7 @@ mod tests {
         }]);
     }
 
+    /// Checks that a shorter second allele with one substitution still splits into two zero-cost alleles.
     #[test]
     fn test_dual_unequal_002() {
         let sequence     = b"ACGTA";
@@ -2091,6 +2110,7 @@ mod tests {
         }]);
     }
 
+    /// Checks that a noisy insertion before the real split is corrected once the consistent substitutions are reached.
     #[test]
     fn test_dual_noise_before_variation() {
         // this test includes a noisy C insertion; it will cause a dual node split that get's corrected later when the true variation is reached
@@ -2138,6 +2158,7 @@ mod tests {
         }]);
     }
 
+    /// Checks that three or more extension candidates still recover the two supported alleles.
     #[test]
     fn test_multi_extension() {
         // test the scenario where 3+ extensions are identified
@@ -2187,6 +2208,7 @@ mod tests {
         }]);
     }
 
+    /// Checks that four equally supported alleles return six dual consensuses, each with total cost 2.
     #[test]
     fn test_equal_options() {
         // test the scenario multiple possible dual consensuses are possible
@@ -2237,6 +2259,7 @@ mod tests {
         }
     }
 
+    /// Checks that a one-base tail difference stays a single consensus and returns both lengths.
     #[test]
     fn test_tail_extension() {
         // test the scenario we have a simple tail extension
@@ -2283,11 +2306,13 @@ mod tests {
         }]);
     }
 
+    /// Checks the `dual_001.csv` reads against their recorded alleles.
     #[test]
     fn test_csv_dual_001() {
         run_test_file("./tests/dual_001.csv", true, None);
     }
 
+    /// Checks that a capped competitor keeps its full vote so a supported one-read allele still meets `min_count`.
     #[test]
     fn test_weighted_capped_competitor_preserves_supported_consensus() {
         use SequenceAssignment::{Consensus1, Consensus2, EditDistanceLimit};
@@ -2343,6 +2368,7 @@ mod tests {
         }
     }
 
+    /// Checks that a zero dual edit-distance delta assigns a read to the worse allele.
     #[test]
     fn test_dual_max_ed_delta() {
         // this is the same test as above BUT we have restricted the dual_max_ed_delta to too low, resulting in one read getting mis-assigned
@@ -2402,6 +2428,7 @@ mod tests {
         assert_eq!(consensus, expected_consensus);
     }
 
+    /// Checks `length_gap_001.csv` under L2 cost with a length gap and a dual edit-distance delta.
     #[test]
     fn test_csv_length_gap_001() {
         run_test_file("./tests/length_gap_001.csv", false, Some(
@@ -2415,6 +2442,7 @@ mod tests {
         ));
     }
 
+    /// Checks that early termination recovers the `dual_early_termination_001.csv` alleles from prefix-truncated reads.
     #[test]
     fn test_csv_early_termination_001() {
         run_test_file("./tests/dual_early_termination_001.csv", true, Some(
@@ -2425,6 +2453,7 @@ mod tests {
         ));
     }
 
+    /// Checks that offset windows place delayed starts so every read scores 0.
     #[test]
     fn test_offset_windows() {
         // this test is _only_ for verifying that our offsets are getting correctly adjust to match
@@ -2463,6 +2492,7 @@ mod tests {
         assert_eq!(&[0, 0, 0], consensus[0].consensus1().scores());
     }
 
+    /// Checks that a start far past activation leaves a DWFA uninitialized and fails finalize.
     #[test]
     fn test_offset_gap_err() {
         // this test is _only_ for verifying that our offsets are getting correctly adjust to match

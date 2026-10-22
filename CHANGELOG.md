@@ -4,7 +4,6 @@
 * Single consensus results report which reads were halted at that cap. `Consensus::assignments()` is `None` when every read was included.
 * Dual consensus results report which allele each read belongs to. A read can tie, or hit the cap on both alleles.
 * Numerous performance enhancements were incorporated. All consensus modes should run faster.
-* Cached wide-frontier bounds and singleton fast paths speed up long-read alignment while preserving the narrow-bitmask path.
 
 ## Bugs
 * Fixed global DWFA finalization so it requires the diagonal that reaches both sequence ends. It previously stopped when any diagonal reached the end of the baseline. Early termination still allows an unused suffix of the other sequence.

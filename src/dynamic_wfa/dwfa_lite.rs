@@ -45,7 +45,7 @@ pub struct DWFALite {
     /// The value stored will always be the number of bases consumed in `other_seq`.
     /// After a proper character addition, _at least one_ of these should always equal the length of `other_seq` - `offset`.
     wavefront: Vec<usize>,
-    // this is an offset into `other_seq` that the baseline starts
+    /// Offset into `other_seq` where the baseline starts.
     offset: usize,
     /// Cached maximum of `wavefront`. Values only grow within one edit distance.
     max_wavefront: usize,
@@ -60,9 +60,12 @@ pub struct DWFALite {
     frontier: Frontier,
 }
 
+/// Which diagonals sit at `extended_len`, which is the "frontier" of the wavefront.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum Frontier {
+    /// The bounds were not computed. The next extension visits every diagonal.
     Unknown,
+    /// Bit `i` is set when diagonal `i` is at `extended_len`.
     Narrow(u128),
     /// Smallest half-open range containing every equality lane; holes are filtered on use.
     /// An empty frontier is represented by `start == end == 0`.
@@ -185,6 +188,11 @@ impl DWFALite {
         let i = match self.frontier {
             Frontier::Narrow(bits) => {
                 let low_bits = bits as u64;
+                // Fall back when any of these is true:
+                // * not active, or the only frontier diagonal sits above bit 63
+                // * zero or several frontier diagonals (`is_power_of_two` rejects 0)
+                // * `other_seq` did not grow by exactly one byte
+                // * the frontier diagonal is not the cached maximum, so `max_wavefront` is not `wavefront[i]`
                 if self.state != DWFALiteState::Active || (bits >> 64) != 0 || !low_bits.is_power_of_two() ||
                     other_seq.len() != self.extended_len + 1 || self.offset + self.max_wavefront != self.extended_len {
                     return None;
@@ -192,6 +200,8 @@ impl DWFALite {
                 low_bits.trailing_zeros() as usize
             },
             Frontier::Wide { start, end } => {
+                // Fall back unless the bounds name one diagonal, one byte was appended,
+                // and that diagonal holds the cached maximum. A one-lane range has no hole.
                 if self.state != DWFALiteState::Active || end != start + 1 ||
                     other_seq.len() != self.extended_len + 1 || self.offset + self.max_wavefront != self.extended_len {
                     return None;
@@ -213,7 +223,7 @@ impl DWFALite {
         }
 
         // update the wavefront and cached maxima
-        // The same bit still marks the frontier: this diagonal moved forward with the one new byte.
+        // This same diagonal is still the only one at the new end, so the frontier metadata stays as it is.
         self.wavefront[i] = d + 1;
         self.max_wavefront = d + 1;
         self.max_baseline = self.max_baseline.max(baseline_offset + 1);
@@ -260,6 +270,7 @@ impl DWFALite {
             maximum_distance == other_seq.len() || 
             (self.config.allow_early_termination && self.maximum_baseline_distance() == baseline_seq.len())
         );
+        // Wide growth does not fill a bitmask. Cache the bounds once the wavefront has caught `other_seq`.
         if self.wavefront.len() > FRONTIER_BITS && matches!(self.frontier, Frontier::Unknown) {
             self.refresh_wide_frontier(other_seq.len());
         }
@@ -310,15 +321,22 @@ impl DWFALite {
                 self.frontier = Frontier::Narrow(new_bits);
             },
             Frontier::Wide { start, end } if other_len >= self.extended_len => {
+                // Only lanes at the previous frontier can move. Holes inside the bounds are skipped.
+                // If none reach the new end, `start == end == 0` is the empty wide frontier.
+                // The new range may still contain holes.
                 let mut next_start = 0;
                 let mut next_end = 0;
                 for (relative, d) in self.wavefront[start..end].iter_mut().enumerate() {
+                    // check if it's a hole in the wide frontier
                     if *d + offset != self.extended_len {
                         continue;
                     }
+
+                    // not a hole, try to extend it
                     let i = start + relative;
                     *d += match_length(baseline_seq, other_seq, *d + edit_distance - i, *d + offset, wildcard);
                     if *d + offset == other_len {
+                        // `next_end == 0` means no diagonal has reached the new end yet, so the first hit sets `next_start`.
                         if next_end == 0 {
                             next_start = i;
                         }
@@ -327,6 +345,8 @@ impl DWFALite {
                     self.max_wavefront = self.max_wavefront.max(*d);
                     self.max_baseline = self.max_baseline.max(*d + edit_distance - i);
                 }
+
+                // update the wide frontier to the new range (can be empty if all failed to extend)
                 self.frontier = Frontier::Wide { start: next_start, end: next_end };
             },
             // general case when the frontier cannot short circuit
@@ -359,20 +379,28 @@ impl DWFALite {
         self.extended_len = other_len;
     }
 
-    /// Publishes wide metadata once after a successful active update, never during finalization.
+    /// Records the half-open bounds of diagonals at `other_len` after an active update.
+    /// Called once the wavefront has caught `other_seq`. Finalization leaves the frontier `Unknown`.
+    /// # Arguments
+    /// * `other_len` - the length of `other_seq` after the update
     fn refresh_wide_frontier(&mut self, other_len: usize) {
         if self.offset + self.max_wavefront > other_len {
             // Overshooting lanes may extend later and cannot be represented by equality-only bounds.
             self.frontier = Frontier::Unknown;
             return;
         }
+
+        // find the first diagonal that is at the end
         let Some(start) = self.wavefront.iter().position(|&d| d + self.offset == other_len) else {
+            // No diagonal is at the end. `start == end == 0` is the empty wide frontier.
             self.frontier = Frontier::Wide { start: 0, end: 0 };
             return;
         };
-        let last = self.wavefront[start..].iter().rposition(|&d| d + self.offset == other_len)
+
+        // find the last diagonal that is at the end, then build the range
+        let last = self.wavefront.iter().rposition(|&d| d + self.offset == other_len)
             .expect("first equality lane remains present");
-        self.frontier = Frontier::Wide { start, end: start + last + 1 };
+        self.frontier = Frontier::Wide { start, end: last + 1 };
     }
 
     /// This will increase the edit distance for this DWFA and create a new larger wavefront.
@@ -500,6 +528,9 @@ impl DWFALite {
     /// At edit distance 2, the middle index is 2 and `gap` is 2, so we check index 4.
     /// If that entry has reached at least 5 bases in the other sequence, it has also
     /// reached all 3 bases in the baseline, so both sequences are finished.
+    /// # Arguments
+    /// * `baseline_len` - the length of the baseline sequence
+    /// * `other_len` - the length of the last sequence supplied to `update()`
     fn reached_global_end(&self, baseline_len: usize, other_len: usize) -> bool {
         // Only the part of `other_seq` after `offset` is included in this alignment
         let m = other_len - self.offset;
@@ -591,9 +622,11 @@ impl DWFALite {
                     }
                 }
             },
+            // the bounds enclose the equality lanes; holes inside the range are skipped
             Frontier::Wide { start, end } if other_seq.len() == self.extended_len => {
                 for (relative, &d) in self.wavefront[start..end].iter().enumerate() {
                     if d + self.offset == other_seq.len() {
+                        // this diagonal is at the end, so we can get it's next symbol
                         let offset = d + self.edit_distance - (start + relative);
                         if offset < baseline_seq.len() {
                             symbols.push(baseline_seq[offset]);
@@ -644,15 +677,11 @@ impl DWFALite {
             }
         }
         if let Frontier::Wide { start, end } = self.frontier {
-            if other_seq.len() == self.extended_len && end <= start + 1 {
-                if start < end {
-                    let d = self.wavefront[start];
-                    if d + self.offset == other_seq.len() {
-                        let offset = d + self.edit_distance - start;
-                        if offset < baseline_seq.len() {
-                            votes.add_single(baseline_seq[offset], weight);
-                        }
-                    }
+            if other_seq.len() == self.extended_len && start + 1 == end {
+                // One lane. A one-lane range has no hole, so `start` is that diagonal.
+                let offset = self.wavefront[start] + self.edit_distance - start;
+                if offset < baseline_seq.len() {
+                    votes.add_single(baseline_seq[offset], weight);
                 }
                 return;
             }

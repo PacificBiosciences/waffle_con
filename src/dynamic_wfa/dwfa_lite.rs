@@ -191,35 +191,26 @@ impl DWFALite {
     /// Returns `None` when this path does not apply and nothing was changed.
     /// Returns `Some` when the diagonal advanced. 
     /// The inner value is the next baseline symbol on that diagonal if it exists, or `None` when the baseline has no further symbol (at end).
-    /// A `Single` frontier names that diagonal. A `Wide` range of one diagonal is the same case.
+    /// A `Single` frontier names that diagonal. `from_bounds` uses `Single` for every one-diagonal range.
     /// # Arguments
     /// * `baseline_seq` - the baseline sequence, theoretically fixed
     /// * `other_seq` - the other sequence, typically getting updates
     #[inline(always)]
     fn advance_single_frontier(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Option<Option<u8>> {
-        let i = match self.frontier {
-            Frontier::Single(i) => {
-                // Fall back when any of these is true:
-                // * not active
-                // * `other_seq` did not grow by exactly one byte
-                // * the frontier diagonal is not the cached maximum, so `max_wavefront` is not `wavefront[i]`
-                if self.state != DWFALiteState::Active ||
-                    other_seq.len() != self.extended_len + 1 || self.offset + self.max_wavefront != self.extended_len {
-                    return None;
-                }
-                i
-            },
-            Frontier::Wide { start, end } => {
-                // Fall back unless the bounds name one diagonal, one byte was appended,
-                // and that diagonal holds the cached maximum. A one-diagonal range has no hole.
-                if self.state != DWFALiteState::Active || end != start + 1 ||
-                    other_seq.len() != self.extended_len + 1 || self.offset + self.max_wavefront != self.extended_len {
-                    return None;
-                }
-                start
-            },
-            Frontier::Unknown => return None,
+        // must be a Single diagonal, or else no-op here
+        let Frontier::Single(i) = self.frontier else {
+            return None;
         };
+
+        // Fall back when any of these is true:
+        // * not active
+        // * `other_seq` did not grow by exactly one byte
+        // * the frontier diagonal is not the cached maximum, so `max_wavefront` is not `wavefront[i]`
+        if self.state != DWFALiteState::Active ||
+            other_seq.len() != self.extended_len + 1 || self.offset + self.max_wavefront != self.extended_len {
+            return None;
+        }
+
         // The frontier holds the cached maximum, saving a dependent load.
         let d = self.max_wavefront;
         debug_assert_eq!(d, self.wavefront[i]);
@@ -831,6 +822,22 @@ mod tests {
             extend(&mut wavefront, ed);
         }
         (update_ed, wavefront)
+    }
+
+    /// In-place growth stays correct after the wavefront passes 128 diagonals, the old bitmask width.
+    #[test]
+    fn test_in_place_growth_past_128_diagonals() {
+        let baseline = vec![b'A'; 200];
+        let other = vec![b'C'];
+        let mut dwfa = DWFALite::default();
+        dwfa.update(&baseline, &other).unwrap();
+        while dwfa.wavefront().len() <= 128 {
+            dwfa.increase_edit_distance(&baseline, &other).unwrap();
+        }
+        assert!(dwfa.wavefront().len() > 128);
+        let (_, expected) = reference_wavefront(&baseline, &other, None, dwfa.edit_distance());
+        assert_eq!(dwfa.wavefront(), &expected[..]);
+        assert_eq!(dwfa.maximum_other_distance(), *expected.iter().max().unwrap());
     }
 
     /// Like the `finalize` benchmark: `other` is `baseline` without one stretch, with a few errors.

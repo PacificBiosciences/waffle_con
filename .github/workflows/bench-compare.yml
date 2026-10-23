@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # Printed in the comparison comment. Criterion requires at least 10 samples.
-      BENCH_SAMPLE_SIZE: 30
+      BENCH_SAMPLE_SIZE: 100
       BENCH_WARMUP: 0.2
       BENCH_MEASUREMENT: 0.5
     steps:

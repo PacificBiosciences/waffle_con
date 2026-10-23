@@ -6,7 +6,7 @@ Note that it can also generate a single consensus if no splits are identified.
 # Example usage
 ```rust
 use waffle_con::consensus::Consensus;
-use waffle_con::dual_consensus::DualConsensusDWFA;
+use waffle_con::dual_consensus::{DualConsensusDWFA, SequenceAssignment};
 use waffle_con::cdwfa_config::ConsensusCost;
 
 let sequences = [
@@ -29,34 +29,71 @@ for s in sequences.iter() {
 // run consensus and check the results
 let consensuses = cdwfa.consensus().unwrap();
 assert_eq!(consensuses.len(), 1);
-assert_eq!(consensuses[0].consensus1(), &Consensus::new(sequences[1].clone(), ConsensusCost::L1Distance, vec![1, 0, 0, 1]));
-assert_eq!(consensuses[0].consensus2().unwrap(), &Consensus::new(sequences[6].clone(), ConsensusCost::L1Distance, vec![1, 1, 0, 0]));
-assert_eq!(consensuses[0].is_consensus1(), &[true, true, true, true, false, false, false, false]);
+assert_eq!(consensuses[0].consensus1(), &Consensus::new(sequences[1].clone(), ConsensusCost::L1Distance, vec![1, 0, 0, 1], None).unwrap());
+assert_eq!(consensuses[0].consensus2().unwrap(), &Consensus::new(sequences[6].clone(), ConsensusCost::L1Distance, vec![1, 1, 0, 0], None).unwrap());
+assert_eq!(consensuses[0].assignments(), &[
+    SequenceAssignment::Consensus1,
+    SequenceAssignment::Consensus1,
+    SequenceAssignment::Consensus1,
+    SequenceAssignment::Consensus1,
+    SequenceAssignment::Consensus2,
+    SequenceAssignment::Consensus2,
+    SequenceAssignment::Consensus2,
+    SequenceAssignment::Consensus2,
+]);
 ```
 */
 
 use log::{debug, trace, warn};
-use priority_queue::PriorityQueue;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use simple_error::{bail, SimpleError};
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
 
 use crate::cdwfa_config::{CdwfaConfig, ConsensusCost};
 use crate::consensus::Consensus;
-use crate::dynamic_wfa::DWFALite;
+use crate::dynamic_wfa::{DWFALite, DWFALiteState, ExtensionVotes, VoteScratch};
+use crate::node_pool::NodePool;
 use crate::pqueue_tracker::PQueueTracker;
+use crate::priority_queue::{CachePriority, PriorityQueue};
 
-type NodePriority = (Reverse<usize>, usize);
+/// Lower cost, then longer consensus, then an earlier tie-breaker.
+type NodePriority = (Reverse<usize>, usize, Reverse<u64>);
+
+/// Which allele a read belongs to after a dual consensus.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SequenceAssignment {
+    /// The read is closer to consensus 1.
+    Consensus1,
+    /// The read is closer to consensus 2.
+    Consensus2,
+    /// Both alleles are tracked and have the same score, and they are not both past the edit-distance cap.
+    EqualScore,
+    /// Both tracked alleles reached the edit-distance cap.
+    EditDistanceLimit,
+}
+
+impl SequenceAssignment {
+    /// Flips allele 1 and allele 2. Ties and double failures are unchanged.
+    fn swap_alleles(self) -> Self {
+        match self {
+            SequenceAssignment::Consensus1 => SequenceAssignment::Consensus2,
+            SequenceAssignment::Consensus2 => SequenceAssignment::Consensus1,
+            other => other,
+        }
+    }
+}
 
 /// Contains a final multi-consensus result
 #[derive(Debug)]
 pub struct DualConsensus {
-    /// The first consensus
+    /// The first consensus.
+    /// Internal `scores` tracks only reads assigned to this allele. `EqualScore` and `EditDistanceLimit` reads are not tracked.
     consensus1: Consensus,
-    /// The second consensus - this one can be optional when only one consensus is identified
+    /// The second consensus. This is `None` when only one consensus is identified.
+    /// Internal `scores` tracks only reads assigned to this allele. `EqualScore` and `EditDistanceLimit` reads are not tracked.
     consensus2: Option<Consensus>,
-    /// same length as input sequences; for each entry, if True, then the corresponding input sequence matches consensus #1; otherwise, it matches #2
-    is_consensus1: Vec<bool>,
+    /// One entry per input sequence: allele 1, allele 2, a score tie, or both alleles past the edit-distance cap.
+    assignments: Vec<SequenceAssignment>,
     /// The scores when compared to consensus1, will be None if it stopped tracking
     scores1: Vec<Option<usize>>,
     /// The scores when compared to consensus2, will be None if it stopped tracking
@@ -67,7 +104,7 @@ impl PartialEq for DualConsensus {
     fn eq(&self, other: &Self) -> bool {
         self.consensus1 == other.consensus1 && 
             self.consensus2 == other.consensus2 && 
-            self.is_consensus1 == other.is_consensus1 
+            self.assignments == other.assignments 
 
             // for now, we do not care about these in the impl
             //&& self.scores1 == other.scores1 && self.scores2 == other.scores2
@@ -76,19 +113,27 @@ impl PartialEq for DualConsensus {
 
 impl DualConsensus {
     /// Generic constructor for outside usage. This does not force consensus order like `from_node(...)`.
+    /// # Arguments
+    /// * `consensus1` - the first consensus
+    /// * `consensus2` - the second consensus, or `None` when only one consensus was identified
+    /// * `assignments` - one assignment per input sequence
+    /// * `scores1` - per-read score against consensus 1; `None` when that read stopped being tracked
+    /// * `scores2` - per-read score against consensus 2; `None` when that read stopped being tracked
+    /// # Errors
+    /// * if `assignments`, `scores1`, and `scores2` have different lengths
     pub fn new(
         consensus1: Consensus, consensus2: Option<Consensus>, 
-        is_consensus1: Vec<bool>, scores1: Vec<Option<usize>>, scores2: Vec<Option<usize>>
+        assignments: Vec<SequenceAssignment>, scores1: Vec<Option<usize>>, scores2: Vec<Option<usize>>
     ) -> Result<Self, SimpleError> {
 
-        if is_consensus1.len() != scores1.len() || is_consensus1.len() != scores2.len() {
-            bail!("is_consensus1, scores1, and scores2 must all be the same length");
+        if assignments.len() != scores1.len() || assignments.len() != scores2.len() {
+            bail!("assignments, scores1, and scores2 must all be the same length");
         }
 
         Ok(Self {
             consensus1,
             consensus2,
-            is_consensus1,
+            assignments,
             scores1,
             scores2,
         })
@@ -98,31 +143,30 @@ impl DualConsensus {
     /// Of note, this will re-order dual alleles alpha-numerically, allowing for predictable outputs.
     /// # Arguments
     /// * `finalized_node` - the node that we are converting to a consensus
-    /// * `consensus_cost` - the cost model that gets propated
-    fn from_node(finalized_node: &DualConsensusNode, consensus_cost: ConsensusCost) -> DualConsensus {
-        // figure out the best consensus and score for each read; note that this assumes no ties
-        let (best_consensus_index, best_consensus_score) = finalized_node.costs(consensus_cost);
-
+    /// * `consensus_cost` - the cost model that gets propagated
+    fn from_node(finalized_node: &DualConsensusNode, consensus_cost: ConsensusCost) -> Result<DualConsensus, SimpleError> {
         // check if we need to swap the order
         let swap_order = finalized_node.is_dual && (finalized_node.consensus2 < finalized_node.consensus1);
 
         // now reformat the above information such that we can build out the multi-consensus return values
-        let mut is_consensus1: Vec<bool> = Default::default();
+        let (full1, full2) = finalized_node.full_cost(consensus_cost);
+        let mut assignments = Vec::with_capacity(finalized_node.dwfas1.len());
         let mut consensus_scores: Vec<Vec<usize>> = vec![vec![]; 2];
-        for (best_con_index, best_con_score) in best_consensus_index.into_iter()
-            .zip(best_consensus_score.into_iter()) {
-            // these MUST be equal length
-            // store that this sequence index matches the particular consensus index
-            assert!(best_con_index <= 1);
-            // toggle the consensus assignment if we swap_order
-            is_consensus1.push((best_con_index == 0) ^ swap_order);
-            // also store this score for this consensus index
-            consensus_scores[best_con_index].push(best_con_score);
+        for seq_index in 0..finalized_node.dwfas1.len() {
+            let internal = finalized_node.read_assignment(seq_index, consensus_cost);
+            // only reads assigned to an allele contribute to that allele's score list
+            match internal {
+                SequenceAssignment::Consensus1 => consensus_scores[0].push(full1[seq_index].expect("assigned consensus is tracked")),
+                SequenceAssignment::Consensus2 => consensus_scores[1].push(full2[seq_index].expect("assigned consensus is tracked")),
+                SequenceAssignment::EqualScore | SequenceAssignment::EditDistanceLimit => {}
+            }
+            // assignments are swapped as we add them if needed
+            assignments.push(if swap_order { internal.swap_alleles() } else { internal });
         }
 
         // now we can store the consensus sequences as well as the corresponding indices in the final output
-        let c1 = Consensus::new(finalized_node.consensus1.clone(), consensus_cost, consensus_scores[0].clone());
-        let c2 = Consensus::new(finalized_node.consensus2.clone(), consensus_cost, consensus_scores[1].clone());
+        let c1 = Consensus::new(finalized_node.consensus1.clone(), consensus_cost, consensus_scores[0].clone(), None)?;
+        let c2 = Consensus::new(finalized_node.consensus2.clone(), consensus_cost, consensus_scores[1].clone(), None)?;
 
         // reformat the actual consensus assignments based on swappage, and build result
         let (consensus1, consensus2) = if swap_order {
@@ -133,23 +177,22 @@ impl DualConsensus {
         };
 
         // now save the scores also
-        let (s1, s2) = finalized_node.full_cost(consensus_cost);
         let (scores1, scores2) = if swap_order {
-            (s2, s1)
+            (full2, full1)
         } else {
-            (s1, s2)
+            (full1, full2)
         };
 
-        DualConsensus {
+        Ok(DualConsensus {
             consensus1,
             consensus2,
-            is_consensus1,
+            assignments,
             scores1,
             scores2
-        }
+        })
     }
 
-    // Returns true if this is a dual consensus result
+    /// Returns true when a second consensus was identified.
     pub fn is_dual(&self) -> bool {
         self.consensus2.is_some()
     }
@@ -163,8 +206,8 @@ impl DualConsensus {
         self.consensus2.as_ref()
     }
 
-    pub fn is_consensus1(&self) -> &[bool] {
-        &self.is_consensus1
+    pub fn assignments(&self) -> &[SequenceAssignment] {
+        &self.assignments
     }
 
     pub fn scores1(&self) -> &[Option<usize>] {
@@ -176,7 +219,7 @@ impl DualConsensus {
     }
 }
 
-/// Core utility that will generate a consensus sequence using the DWFA approach.
+/// Core utility that generates one or two consensus sequences using the DWFA approach.
 /// For now, it will assume that all sequences are full length representations
 #[derive(Debug, Default)]
 pub struct DualConsensusDWFA<'a>  {
@@ -191,7 +234,7 @@ pub struct DualConsensusDWFA<'a>  {
 }
 
 impl<'a> DualConsensusDWFA<'a> {
-    /// Creates a new instance of ConsensusDWFA with the specified config.
+    /// Creates a new instance of DualConsensusDWFA with the specified config.
     /// # Arguments
     /// * `config` - the type of consensus score we want to use
     /// # Errors
@@ -212,7 +255,7 @@ impl<'a> DualConsensusDWFA<'a> {
         self.add_sequence_offset(sequence, None)
     }
 
-    /// Adds a new sequence to the list with no offset.
+    /// Adds a new sequence and the last consensus offset where it may start.
     /// # Arguments
     /// * `sequence` - the new sequence to add
     /// * `last_offset` - an optional offset into the consensus that is the last allowed offset for the sequence to start
@@ -234,7 +277,7 @@ impl<'a> DualConsensusDWFA<'a> {
         Ok(())
     }
 
-    // The core function that gets called after adding all the sequences we care about
+    /// The core function that gets called after adding all the sequences we care about.
     /// # Errors
     /// * if the DWFA throws errors
     pub fn consensus(&self) -> Result<Vec<DualConsensus>, Box<dyn std::error::Error>> {
@@ -310,13 +353,12 @@ impl<'a> DualConsensusDWFA<'a> {
         let mut single_tracker = PQueueTracker::with_capacity(initial_size, max_capacity_per_size);
         let mut dual_tracker = PQueueTracker::with_capacity(initial_size, max_capacity_per_size);
 
-        let initial_node = DualConsensusNode::new_root_node(&offsets, self.config.wildcard, self.config.allow_early_termination)?;
-        let initial_priority = initial_node.priority(self.consensus_cost());
+        let initial_node = DualConsensusNode::new_root_node(&self.sequences, &offsets, &self.config)?;
 
-        // start the priority queue, which defaults to bigger is better so we need a Reverse since want smaller costs
-        let mut pqueue: PriorityQueue<DualConsensusNode, NodePriority> = PriorityQueue::new();
+        // Max-heap ordered by cached priority: lower cost, then longer consensus, then earlier tie-breaker.
+        let mut pqueue = PriorityQueue::new(self.consensus_cost());
         single_tracker.insert(initial_node.max_consensus_length());
-        pqueue.push(initial_node, initial_priority);
+        pqueue.push(initial_node);
 
         let mut ret: Vec<DualConsensus> = vec![];
         let mut last_indiv = 0;
@@ -335,6 +377,18 @@ impl<'a> DualConsensusDWFA<'a> {
             )
         ];
 
+        // buffers that each search step reuses
+        let mut node_pool = NodePool::new();
+        let mut votes = ExtensionVotes::default();
+        let mut scratch = VoteScratch::default();
+        let mut extension_candidates1: Vec<(u8, f64)> = vec![];
+        let mut extension_candidates2: Vec<(u8, f64)> = vec![];
+        let mut opt_ec1: Vec<Option<u8>> = vec![];
+        let mut opt_ec2: Vec<Option<u8>> = vec![];
+        let mut extension_pairs: Vec<(Option<u8>, Option<u8>)> = vec![];
+        let mut children: Vec<NodeExtension> = vec![];
+        let mut sorted_candidates: Vec<(Reverse<f64>, u8)> = vec![];
+
         // the way this will work is that we will eventually find one or more answers and anything worse will get drained off until no possibilities remain
         let mut iteration = 0;
         while !pqueue.is_empty() {
@@ -352,7 +406,8 @@ impl<'a> DualConsensusDWFA<'a> {
             }
 
             // get the top node and check if it's bad
-            let (top_node, top_cost) = pqueue.pop().unwrap();
+            let top_node = pqueue.pop().unwrap();
+            let top_cost = top_node.queued_priority();
             let top_len = top_node.max_consensus_length();
 
             let (threshold_cutoff, at_capacity) = if top_node.is_dual {
@@ -381,6 +436,7 @@ impl<'a> DualConsensusDWFA<'a> {
                 top_node.is_dual_imbalanced(active_min_count[top_len] as usize) {
                 nodes_ignored += 1;
                 trace!("\tignored {} || {} || {}", top_cost.0.0 > maximum_error, top_len < threshold_cutoff, top_node.is_dual_imbalanced(active_min_count[top_node.max_consensus_length()] as usize));
+                node_pool.recycle(top_node);
                 continue;
             }
 
@@ -435,10 +491,12 @@ impl<'a> DualConsensusDWFA<'a> {
             */
 
             // now check if this node has reached the end
-            if top_node.reached_all_end(&self.sequences, self.config.allow_early_termination) {
+            let reached_all_end = top_node.reached_all_end_quick(&self.sequences, self.config.allow_early_termination);
+            debug_assert_eq!(reached_all_end, top_node.reached_all_end(&self.sequences, self.config.allow_early_termination));
+            if reached_all_end {
                 // this node *might* be done, we need to finalize it to be sure
                 // we also need to do it in a clone since it might not be finalized and we need to keep extending
-                let mut finalized_node = top_node.clone();
+                let mut finalized_node = node_pool.clone_node(&top_node);
                 finalized_node.finalize(&self.sequences)?;
 
                 // check if this is a dual node, but without enough support on each allele
@@ -474,7 +532,7 @@ impl<'a> DualConsensusDWFA<'a> {
                         let dual_con_result = DualConsensus::from_node(
                             &finalized_node,
                             self.config.consensus_cost
-                        );
+                        )?;
                         trace!("\tadding to ret");//: {dual_con_result:?}");
                         trace!("\tcon1: {}", std::str::from_utf8(dual_con_result.consensus1().sequence())?);
                         if let Some(c2) = dual_con_result.consensus2() {
@@ -489,6 +547,7 @@ impl<'a> DualConsensusDWFA<'a> {
                     // note that it may still be a candidate for extension though
                     trace!("Finalized node is imbalanced, ignoring.");
                 }
+                node_pool.recycle(finalized_node);
             }
 
             // everything past this point is about extending the top_node further
@@ -515,12 +574,12 @@ impl<'a> DualConsensusDWFA<'a> {
             // this fetches the list of options according to the WFA so far
             // NOTE: this CAN include the wildcard, but only if the wildcard is the only character
             let weighted_by_ed = self.config.weighted_by_ed;
-            let extension_candidates1 = top_node.get_extension_candidates(&self.sequences, self.config.wildcard, true, weighted_by_ed);
+            top_node.get_extension_candidates(&self.sequences, self.config.wildcard, true, weighted_by_ed, &mut votes, &mut scratch, &mut extension_candidates1);
             // let min_count1 = active_min_count[top_len];
             let min_count1 = self.config.min_count.max(
-                (self.config.min_af * extension_candidates1.values().sum::<f64>()).ceil() as u64
+                (self.config.min_af * extension_candidates1.iter().map(|&(_symbol, count)| count).sum::<f64>()).ceil() as u64
             );
-            let max_observed1 = extension_candidates1.values().cloned().max_by(|a, b| a.total_cmp(b))
+            let max_observed1 = extension_candidates1.iter().map(|&(_symbol, count)| count).max_by(|a, b| a.total_cmp(b))
                 // if no observation, then just use min count
                 .unwrap_or(min_count1 as f64);
             
@@ -529,12 +588,12 @@ impl<'a> DualConsensusDWFA<'a> {
 
             if top_node.is_dual {
                 // get the second candidate set also
-                let extension_candidates2 = top_node.get_extension_candidates(&self.sequences, self.config.wildcard, false, weighted_by_ed);
+                top_node.get_extension_candidates(&self.sequences, self.config.wildcard, false, weighted_by_ed, &mut votes, &mut scratch, &mut extension_candidates2);
                 // let min_count2 = active_min_count[top_len];
                 let min_count2 = self.config.min_count.max(
-                    (self.config.min_af * extension_candidates2.values().sum::<f64>()).ceil() as u64
+                    (self.config.min_af * extension_candidates2.iter().map(|&(_symbol, count)| count).sum::<f64>()).ceil() as u64
                 );
-                let max_observed2 = extension_candidates2.values().cloned().max_by(|a, b| a.total_cmp(b))
+                let max_observed2 = extension_candidates2.iter().map(|&(_symbol, count)| count).max_by(|a, b| a.total_cmp(b))
                     // if no observation, then just use min count
                     .unwrap_or(min_count2 as f64);
             
@@ -544,160 +603,132 @@ impl<'a> DualConsensusDWFA<'a> {
                 // one thing we have to handle here is the situation where alleles are different length
                 // this means one might want more extensions and the other is all done
                 // so lets check if either allele is ready to be done
-                let is_con1_finalized = top_node.reached_consensus_end(&self.sequences, true, self.config.allow_early_termination);
-                let is_con2_finalized = top_node.reached_consensus_end(&self.sequences, false, self.config.allow_early_termination);
+                let is_con1_finalized = top_node.reached_consensus_end_quick(&self.sequences, true, self.config.allow_early_termination);
+                let is_con2_finalized = top_node.reached_consensus_end_quick(&self.sequences, false, self.config.allow_early_termination);
+                debug_assert_eq!(is_con1_finalized, top_node.reached_consensus_end(&self.sequences, true, self.config.allow_early_termination));
+                debug_assert_eq!(is_con2_finalized, top_node.reached_consensus_end(&self.sequences, false, self.config.allow_early_termination));
 
                 trace!("\tec1: {extension_candidates1:?}, {active_threshold1}");
                 trace!("\tec2: {extension_candidates2:?}, {active_threshold2}");
 
                 // now create adjust extension lists that can have None
-                let opt_ec1: Vec<Option<u8>> = {
-                    let mut v = vec![];
-                    // if consensus 1 has at least one final candidate OR the candidate list is empty OR it's already locked
-                    // THEN we need the no-extend option None
-                    if is_con1_finalized || extension_candidates1.is_empty() || top_node.is_con1_locked() {
-                        v.push(None);
-                    }
+                opt_ec1.clear();
+                // if consensus 1 has at least one final candidate OR the candidate list is empty OR it's already locked
+                // THEN we need the no-extend option None
+                if is_con1_finalized || extension_candidates1.is_empty() || top_node.is_con1_locked() {
+                    opt_ec1.push(None);
+                }
 
-                    // do not add extensions if we are sequence locked
-                    if !top_node.is_con1_locked() {
-                        v.extend(extension_candidates1.iter()
-                            .filter_map(|(&symbol, &count)| {
-                                // if this character occurs fewer than the threshold times, remove it from the candidate set
-                                if count < active_threshold1 {
-                                    None
-                                } else {
-                                    // double Some is because of filter_map
-                                    Some(Some(symbol))
-                                }
-                            })
-                        );
-                    }
-                    v
-                };
-
-                let opt_ec2: Vec<Option<u8>> = {
-                    let mut v = vec![];
-                    // if consensus 2 has at least one final candidate OR the candidate list is empty OR it's already locked
-                    // then we need the no-extend option None
-                    if is_con2_finalized || extension_candidates2.is_empty() || top_node.is_con2_locked() {
-                        v.push(None);
-                    }
-
-                    // do not add extensions if we are sequence locked
-                    if !top_node.is_con2_locked() {
-                        v.extend(extension_candidates2.iter().filter_map(|(&symbol, &count)| {
-                            // if this character occurs fewer than the threshold times, remove it from the candidate set
-                            if count < active_threshold2 {
-                                None
-                            } else {
-                                // double Some is because of filter_map
-                                Some(Some(symbol))
-                            }
-                        })
+                // do not add extensions if we are sequence locked
+                if !top_node.is_con1_locked() {
+                    // if this character occurs fewer than the threshold times, remove it from the candidate set
+                    opt_ec1.extend(extension_candidates1.iter()
+                        .filter(|&&(_symbol, count)| count >= active_threshold1)
+                        .map(|&(symbol, _count)| Some(symbol))
                     );
-                    }
-                    v
-                };
+                }
+
+                opt_ec2.clear();
+                // if consensus 2 has at least one final candidate OR the candidate list is empty OR it's already locked
+                // then we need the no-extend option None
+                if is_con2_finalized || extension_candidates2.is_empty() || top_node.is_con2_locked() {
+                    opt_ec2.push(None);
+                }
+
+                // do not add extensions if we are sequence locked
+                if !top_node.is_con2_locked() {
+                    // if this character occurs fewer than the threshold times, remove it from the candidate set
+                    opt_ec2.extend(extension_candidates2.iter()
+                        .filter(|&&(_symbol, count)| count >= active_threshold2)
+                        .map(|&(symbol, _count)| Some(symbol))
+                    );
+                }
 
                 // make sure we always have something in each
                 assert!(!opt_ec1.is_empty() && !opt_ec2.is_empty());
 
-                for opt_can1 in opt_ec1.iter() {
-                    for opt_can2 in opt_ec2.iter() {
-                        if opt_can1.is_none() && opt_can2.is_none() {
-                            // we have to extend at least one of them or else it's the exact same node
-                            continue;
-                        }
+                // pair wise add each extension; we have to extend at least one of them or else it's the exact same node
+                extension_pairs.clear();
+                extension_pairs.extend(opt_ec1.iter()
+                    .flat_map(|&opt_can1| opt_ec2.iter().map(move |&opt_can2| (opt_can1, opt_can2)))
+                    .filter(|(opt_can1, opt_can2)| opt_can1.is_some() || opt_can2.is_some()));
 
-                        trace!("\tExtending with: {opt_can1:?} + {opt_can2:?}");
+                // the last child takes `top_node` instead of a clone
+                let num_children = extension_pairs.len();
+                let mut parent = Some(top_node);
+                for (child_index, &(opt_can1, opt_can2)) in extension_pairs.iter().enumerate() {
+                    trace!("\tExtending with: {opt_can1:?} + {opt_can2:?}");
 
-                        // pair wise add each extension; above check enforces that at least one of these `if` statements are executed
-                        let mut new_node = top_node.clone();
-                        if let Some(c1) = opt_can1 {
-                            // we have a base to add
-                            new_node.push(&self.sequences, *c1, true)?;
-                        } else {
-                            // we don't, lock the sequence in place so we do not get duplicate nodes
-                            new_node.lock_sequence(true);
-                        }
-                        if let Some(c2) = opt_can2 {
-                            // we have a base to add
-                            new_node.push(&self.sequences, *c2, false)?;
-                        } else {
-                            // we don't, lock the sequence in place so we do not get duplicate nodes
-                            new_node.lock_sequence(false);
-                        }
+                    let mut new_node = if child_index + 1 == num_children {
+                        parent.take().unwrap()
+                    } else {
+                        node_pool.clone_node(parent.as_ref().unwrap())
+                    };
 
-                        // check if we need to activate any strings
-                        let opt_activate_list = activate_points.get(&new_node.max_consensus_length());
-                        if let Some(activate_list) = opt_activate_list {
-                            assert!(!activate_list.is_empty());
-                            for &seq_index in activate_list.iter() {
-                                new_node.activate_sequence(self.sequences[seq_index], seq_index, offset_window, offset_compare_length, self.config.wildcard, self.config.allow_early_termination)?;
-                            }
-                        }
-
-                        // check if we can prune anything after extensions
-                        new_node.prune_dwfa(self.config.dual_max_ed_delta)?;
-
-                        // get the new cost and put it in the queue
-                        let new_priority = new_node.priority(self.consensus_cost());
-                        assert!(new_node.is_dual);
-                        dual_tracker.insert(new_node.max_consensus_length()); // top_node is already dual
-                        assert!(pqueue.push(new_node.clone(), new_priority).is_none());
+                    // the filter above enforces that at least one of these `if` statements are executed
+                    if let Some(c1) = opt_can1 {
+                        // we have a base to add
+                        new_node.push(&self.sequences, c1, true)?;
+                    } else {
+                        // we don't, lock the sequence in place so we do not get duplicate nodes
+                        new_node.lock_sequence(true);
                     }
-                }
-            } else {
-                // this is currently a non-dual node
-                // first, handle the option where it stays as non-dual
-                trace!("\tec1: {extension_candidates1:?}, {active_threshold1}");
-                for (&symbol, &count) in extension_candidates1.iter() {
-                    if count < active_threshold1 {
-                        // this symbol was not observed enough times, skip it to reduce overhead
-                        continue;
+                    if let Some(c2) = opt_can2 {
+                        // we have a base to add
+                        new_node.push(&self.sequences, c2, false)?;
+                    } else {
+                        // we don't, lock the sequence in place so we do not get duplicate nodes
+                        new_node.lock_sequence(false);
                     }
-
-                    // clone and add the symbol
-                    let mut new_node = top_node.clone();
-                    new_node.push(&self.sequences, symbol, true)?;
 
                     // check if we need to activate any strings
                     let opt_activate_list = activate_points.get(&new_node.max_consensus_length());
                     if let Some(activate_list) = opt_activate_list {
                         assert!(!activate_list.is_empty());
                         for &seq_index in activate_list.iter() {
-                            new_node.activate_sequence(self.sequences[seq_index], seq_index, offset_window, offset_compare_length, self.config.wildcard, self.config.allow_early_termination)?;
+                            new_node.activate_sequence(self.sequences[seq_index], seq_index, offset_window, offset_compare_length, &self.config)?;
                         }
                     }
 
+                    // check if we can prune anything after extensions
+                    new_node.prune_dwfa(self.config.dual_max_ed_delta)?;
+
                     // get the new cost and put it in the queue
-                    let new_priority = new_node.priority(self.consensus_cost());
-                    assert!(!new_node.is_dual);
-                    single_tracker.insert(new_node.max_consensus_length());
-                    assert!(pqueue.push(new_node.clone(), new_priority).is_none());
+                    assert!(new_node.is_dual);
+                    dual_tracker.insert(new_node.max_consensus_length()); // top_node is already dual
+                    pqueue.push(new_node);
                 }
+                // without children, `top_node` is dropped
+                if let Some(node) = parent {
+                    node_pool.recycle(node);
+                }
+            } else {
+                // this is currently a non-dual node
+                // first, handle the option where it stays as non-dual
+                trace!("\tec1: {extension_candidates1:?}, {active_threshold1}");
+                children.clear();
+                children.extend(extension_candidates1.iter()
+                    // a symbol that was not observed enough times is skipped to reduce overhead
+                    .filter(|&&(_symbol, count)| count >= active_threshold1)
+                    .map(|&(symbol, _count)| NodeExtension::Single(symbol)));
 
                 // now handle dual-node generation
                 let mut num_passing = 0;
-                let sorted_candidates = {
-                    let mut sc: Vec<_> = extension_candidates1.iter()
-                        .filter_map(|(&c, &count)| {
-                            // when it comes to dual splitting nodes, we care about hitting the minimum count
-                            if self.config.wildcard.is_some() && c == self.config.wildcard.unwrap() {
-                                // this is the wildcard, we do not count it for the purpose of dual splitting
-                                None
-                            } else {
-                                if count >= min_count1 as f64 {
-                                    num_passing += 1;
-                                }
-                                Some((Reverse(count), c))
+                sorted_candidates.clear();
+                sorted_candidates.extend(extension_candidates1.iter()
+                    .filter_map(|&(c, count)| {
+                        // when it comes to dual splitting nodes, we care about hitting the minimum count
+                        if self.config.wildcard.is_some() && c == self.config.wildcard.unwrap() {
+                            // this is the wildcard, we do not count it for the purpose of dual splitting
+                            None
+                        } else {
+                            if count >= min_count1 as f64 {
+                                num_passing += 1;
                             }
-                        })
-                        .collect();
-                    sc.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                    sc
-                };
+                            Some((Reverse(count), c))
+                        }
+                    }));
+                sorted_candidates.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
                 if num_passing > 1 {
                     // c1 in outer loop
@@ -707,35 +738,61 @@ impl<'a> DualConsensusDWFA<'a> {
                             // sanity checks to make sure we never try to make a dual node where one extension is the wildcard
                             assert!(self.config.wildcard.is_none() || c1 != self.config.wildcard.unwrap());
                             assert!(self.config.wildcard.is_none() || c2 != self.config.wildcard.unwrap());
-                            
-                            // convert the clone into a dual node with the candidate; c1 should be the "major" candidate due to the above sort
-                            let mut new_node = top_node.clone();
-                            new_node.activate_dual(&self.sequences, c1, c2)?;
-
-                            // check if we need to activate any strings
-                            let opt_activate_list = activate_points.get(&new_node.max_consensus_length());
-                            if let Some(activate_list) = opt_activate_list {
-                                assert!(!activate_list.is_empty());
-                                for &seq_index in activate_list.iter() {
-                                    new_node.activate_sequence(self.sequences[seq_index], seq_index, offset_window, offset_compare_length, self.config.wildcard, self.config.allow_early_termination)?;
-                                }
-                            }
-
-                            // now prune
-                            new_node.prune_dwfa(self.config.dual_max_ed_delta)?;
-
-                            // get the new cost and put it in the queue
-                            let new_priority = new_node.priority(self.consensus_cost());
-                            assert!(new_node.is_dual);
-                            dual_tracker.insert(new_node.max_consensus_length());
-                            assert!(pqueue.push(new_node.clone(), new_priority).is_none());
+                            // c1 should be the "major" candidate due to the above sort
+                            children.push(NodeExtension::Dual(c1, c2));
                         }
                     }
                 }
+
+                // the last child takes `top_node` instead of a clone
+                let num_children = children.len();
+                let mut parent = Some(top_node);
+                for (child_index, &child) in children.iter().enumerate() {
+                    let mut new_node = if child_index + 1 == num_children {
+                        parent.take().unwrap()
+                    } else {
+                        node_pool.clone_node(parent.as_ref().unwrap())
+                    };
+
+                    match child {
+                        // add the symbol
+                        NodeExtension::Single(symbol) => new_node.push(&self.sequences, symbol, true)?,
+                        // convert the node into a dual node with the candidates
+                        NodeExtension::Dual(c1, c2) => new_node.activate_dual(&self.sequences, c1, c2)?,
+                    };
+
+                    // check if we need to activate any strings
+                    let opt_activate_list = activate_points.get(&new_node.max_consensus_length());
+                    if let Some(activate_list) = opt_activate_list {
+                        assert!(!activate_list.is_empty());
+                        for &seq_index in activate_list.iter() {
+                            new_node.activate_sequence(self.sequences[seq_index], seq_index, offset_window, offset_compare_length, &self.config)?;
+                        }
+                    }
+
+                    // get the new cost and put it in the queue
+                    match child {
+                        NodeExtension::Single(_) => {
+                            assert!(!new_node.is_dual);
+                            single_tracker.insert(new_node.max_consensus_length());
+                        },
+                        NodeExtension::Dual(_, _) => {
+                            // now prune
+                            new_node.prune_dwfa(self.config.dual_max_ed_delta)?;
+                            assert!(new_node.is_dual);
+                            dual_tracker.insert(new_node.max_consensus_length());
+                        },
+                    };
+                    pqueue.push(new_node);
+                }
+                // without children, `top_node` is dropped
+                if let Some(node) = parent {
+                    node_pool.recycle(node);
+                }
             }
 
-            // TODO: remove this eventually, it's a summation check
-            assert_eq!(pqueue.len(), single_tracker.unfiltered_len() + dual_tracker.unfiltered_len());
+            // TODO: remove this eventually, it's a summation check; it sums both trackers, so only run it in debug builds
+            debug_assert_eq!(pqueue.len(), single_tracker.unfiltered_len() + dual_tracker.unfiltered_len());
         }
 
         assert_eq!(single_tracker.len(), 0);
@@ -774,8 +831,8 @@ impl<'a> DualConsensusDWFA<'a> {
 
             // TODO: how do we want to handle this long-term? this returns an empty string consensus
             let no_offsets = vec![None; self.sequences.len()]; // we need these to get costs of 0
-            let root_node = DualConsensusNode::new_root_node(&no_offsets, self.config.wildcard, self.config.allow_early_termination)?;
-            ret.push(DualConsensus::from_node(&root_node, self.consensus_cost()));
+            let root_node = DualConsensusNode::new_root_node(&self.sequences, &no_offsets, &self.config)?;
+            ret.push(DualConsensus::from_node(&root_node, self.consensus_cost())?);
         }
 
         debug!("nodes_explored: {nodes_explored}");
@@ -800,8 +857,17 @@ impl<'a> DualConsensusDWFA<'a> {
     }
 }
 
-/// Wrapper for a node containing a partial consensus as well as the DWFA tracking for that node
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+/// One child of a non-dual node, in the order the children are queued.
+#[derive(Clone, Copy, Debug)]
+enum NodeExtension {
+    /// Extend the single consensus with this symbol.
+    Single(u8),
+    /// Split into a dual node; the first symbol is the major candidate.
+    Dual(u8, u8),
+}
+
+/// Wrapper for a node containing a partial consensus as well as the DWFA tracking for that node.
+#[derive(Debug, Eq)]
 struct DualConsensusNode {
     /// if True, then this node is tracking two consensuses
     is_dual: bool,
@@ -809,6 +875,13 @@ struct DualConsensusNode {
     is_con1_locked: bool,
     /// if True, we are not allowed to modify consensus2 anymore
     is_con2_locked: bool,
+    /// False when no DWFA of consensus 1 is at the end of its baseline sequence. True when one may be at the end.
+    /// `push()` sets it exactly, because it updates every DWFA of the consensus. `activate_dual()` pushes both
+    /// consensuses after it copies the DWFAs, so both flags are exact after it. Pruning only removes DWFAs, so a flag
+    /// stays valid. An activation sets both flags to true. See `reached_all_end_quick()`.
+    maybe_at_end1: bool,
+    /// The same as `maybe_at_end1`, for consensus 2
+    maybe_at_end2: bool,
     /// The primary consensus sequence
     consensus1: Vec<u8>,
     /// The secondary consensus sequence
@@ -817,26 +890,91 @@ struct DualConsensusNode {
     dwfas1: Vec<Option<DWFALite>>,
     /// The set of DWFAs for consensus2; these are options because we stop tracking once the scores diverge
     dwfas2: Vec<Option<DWFALite>>,
+    /// Rank in the search heap: lower cost, then longer consensus, then earlier tie-breaker. Set by `cache_priority`.
+    queued_priority: NodePriority,
+}
+
+impl Clone for DualConsensusNode {
+    fn clone(&self) -> Self {
+        DualConsensusNode {
+            is_dual: self.is_dual,
+            is_con1_locked: self.is_con1_locked,
+            is_con2_locked: self.is_con2_locked,
+            maybe_at_end1: self.maybe_at_end1,
+            maybe_at_end2: self.maybe_at_end2,
+            consensus1: self.consensus1.clone(),
+            consensus2: self.consensus2.clone(),
+            dwfas1: self.dwfas1.clone(),
+            dwfas2: self.dwfas2.clone(),
+            queued_priority: self.queued_priority,
+        }
+    }
+
+    /// Reuses the buffers of `self`, down to the DWFA wavefronts; see `NodePool`.
+    /// # Arguments
+    /// * `source` - the node to copy
+    fn clone_from(&mut self, source: &Self) {
+        self.is_dual = source.is_dual;
+        self.is_con1_locked = source.is_con1_locked;
+        self.is_con2_locked = source.is_con2_locked;
+        self.maybe_at_end1 = source.maybe_at_end1;
+        self.maybe_at_end2 = source.maybe_at_end2;
+        self.consensus1.clone_from(&source.consensus1);
+        self.consensus2.clone_from(&source.consensus2);
+        self.dwfas1.clone_from(&source.dwfas1);
+        self.dwfas2.clone_from(&source.dwfas2);
+        self.queued_priority = source.queued_priority;
+    }
+}
+
+// The following Eq and Ord implementations are specifically for the Binary Heap.
+// They should not be used for actual node comparison.
+
+impl PartialEq for DualConsensusNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.queued_priority == other.queued_priority
+    }
+}
+
+impl PartialOrd for DualConsensusNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DualConsensusNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap pops the greatest node. queued_priority already ranks a lower edit distance,
+        // then a longer consensus, then an earlier tie-breaker.
+        self.queued_priority.cmp(&other.queued_priority)
+    }
 }
 
 impl DualConsensusNode {
     /// Constructor for a new consensus search root node.
     /// Note that initial it is not a dual node, it will become that when divergence is detected.
     /// # Arguments
+    /// * `sequences` - the baseline reads, parallel to `offsets`
     /// * `offsets` - a set of offsets into the sequences where the approximate starts are
-    /// * `wildcard` - an optional wildcard symbol that will match anything
-    /// * `allow_early_termination` - if true, then it will allow the consensus to go beyond the provided baseline sequences without penalty
+    /// * `config` - consensus configuration, including the optional edit-distance cap
     /// # Errors
     /// * if DWFA construction fails
-    fn new_root_node(offsets: &[Option<usize>], wildcard: Option<u8>, allow_early_termination: bool) -> Result<DualConsensusNode, Box<dyn std::error::Error>> {
-        let dwfas: Vec<Option<DWFALite>> = offsets.iter()
-            .map(|offset| match offset {
+    /// * if `sequences` and `offsets` have different lengths
+    fn new_root_node(sequences: &[&[u8]], offsets: &[Option<usize>], config: &CdwfaConfig) -> Result<DualConsensusNode, Box<dyn std::error::Error>> {
+        if sequences.len() != offsets.len() {
+            bail!("Sequence and offset counts must match.");
+        }
+        let mut dwfas = Vec::with_capacity(offsets.len());
+        for (sequence, offset) in sequences.iter().zip(offsets.iter()) {
+            let dwfa = if offset.is_some() {
                 // we have an offset, so do not create a map
-                Some(_o) => None,
-                // we don't have an offset, so this is active from the start
-                None => Some(DWFALite::new(wildcard, allow_early_termination))
-            })
-            .collect();
+                None
+            } else {
+                // active from the start; cap is fixed from this read's length
+                Some(DWFALite::new(config.dwfa_lite_config_for(sequence.len())?))
+            };
+            dwfas.push(dwfa);
+        }
 
         let active_count = dwfas.iter().filter(|d| d.is_some()).count();
         if active_count == 0 {
@@ -848,10 +986,13 @@ impl DualConsensusNode {
             is_dual: false,
             is_con1_locked: false,
             is_con2_locked: false,
+            maybe_at_end1: true,
+            maybe_at_end2: true,
             consensus1: vec![],
             consensus2: vec![],
             dwfas1: dwfas,
-            dwfas2: vec![None; offsets.len()]
+            dwfas2: vec![None; offsets.len()],
+            queued_priority: (Reverse(0), 0, Reverse(0)),
         })
     }
 
@@ -861,10 +1002,13 @@ impl DualConsensusNode {
     /// * `seq_index` - the sequence index, which will map to the DWFAs
     /// * `offset_window` - the window we are searching for a best match
     /// * `offset_compare_length` - the amount of bases we are comparing
-    /// * `wildcard` - optional wildcard for scoring, passed into DWFA
-    /// * `allow_early_termination` - enables sequences to end partway through the consensus, passed into DWFA
-    fn activate_sequence(&mut self, sequence: &[u8], seq_index: usize, offset_window: usize, offset_compare_length: usize, wildcard: Option<u8>, allow_early_termination: bool) -> Result<(), Box<dyn std::error::Error>> {
+    /// * `config` - consensus configuration, including wildcard, early termination, and the edit-distance cap
+    fn activate_sequence(&mut self, sequence: &[u8], seq_index: usize, offset_window: usize, offset_compare_length: usize, config: &CdwfaConfig) -> Result<(), Box<dyn std::error::Error>> {
         // figure out whether we need to just do con1 or both
+        // a new DWFA may be at its end
+        self.maybe_at_end1 = true;
+        self.maybe_at_end2 = true;
+
         let activators = if self.is_dual {
             vec![(&mut self.dwfas1, &self.consensus1), (&mut self.dwfas2, &self.consensus2)]
         } else {
@@ -885,18 +1029,18 @@ impl DualConsensusNode {
 
             // figure out which offset has the best score; assume the middle of the offset window is the best
             let mut best_offset = con_len.saturating_sub(offset_compare_length + offset_window / 2);
-            let mut min_ed = crate::sequence_alignment::wfa_ed_config(&consensus[best_offset..], &sequence[0..offset_compare_length], false, wildcard);
+            let mut min_ed = crate::sequence_alignment::wfa_ed_config(&consensus[best_offset..], &sequence[0..offset_compare_length], false, config.wildcard);
             
             for p in start_position..end_position {
-                let ed = crate::sequence_alignment::wfa_ed_config(&consensus[p..], &sequence[0..offset_compare_length], false, wildcard);
+                let ed = crate::sequence_alignment::wfa_ed_config(&consensus[p..], &sequence[0..offset_compare_length], false, config.wildcard);
                 if ed < min_ed {
                     min_ed = ed;
                     best_offset = p;
                 }
             }
 
-            // now set up the DWFA with the best offset
-            let mut new_dwfa = DWFALite::new(wildcard, allow_early_termination);
+            // now set up the DWFA with the best offset and a cap from this read's length
+            let mut new_dwfa = DWFALite::new(config.dwfa_lite_config_for(sequence.len())?);
             new_dwfa.set_offset(best_offset);
             new_dwfa.update(sequence, consensus)?;
             dwfas[seq_index] = Some(new_dwfa);
@@ -936,11 +1080,18 @@ impl DualConsensusNode {
         // first extend the consensus
         consensus_seq.push(symbol);
 
-        // now adjust the corresponding DWFA
+        // now adjust the corresponding DWFA; this updates every DWFA of the consensus, so the end flag is exact
+        let mut maybe_at_end = false;
         for (&baseline, opt_dwfa) in baseline_sequences.iter().zip(dwfa_iter) {
             if let Some(dwfa) = opt_dwfa {
                 dwfa.update(baseline, consensus_seq)?;
+                maybe_at_end |= dwfa.reached_baseline_end(baseline);
             }
+        }
+        if is_consensus1 {
+            self.maybe_at_end1 = maybe_at_end;
+        } else {
+            self.maybe_at_end2 = maybe_at_end;
         }
         Ok(())
     }
@@ -1130,10 +1281,64 @@ impl DualConsensusNode {
         (best_consensus_index, best_consensus_score)
     }
 
+    /// Labels one read from the two tracked DWFAs, before any alphabetical allele swap.
+    fn read_assignment(&self, seq_index: usize, consensus_cost: ConsensusCost) -> SequenceAssignment {
+        // helper functions to get the score and state of a DWFA
+        let score = |dwfa: &DWFALite| match consensus_cost {
+            ConsensusCost::L1Distance => dwfa.edit_distance(),
+            ConsensusCost::L2Distance => dwfa.edit_distance().pow(2),
+        };
+        let exceeded = |dwfa: &DWFALite| dwfa.state() == DWFALiteState::ExceededEditDistanceLimit;
+
+        // first, match on the existence of the DWFAs
+        match (self.dwfas1[seq_index].as_ref(), self.dwfas2[seq_index].as_ref()) {
+            // if one one is tracked, we still need to check if that one hit the ED limit
+            (Some(first), None) => {
+                if exceeded(first) {
+                    SequenceAssignment::EditDistanceLimit
+                } else {
+                    SequenceAssignment::Consensus1
+                }
+            },
+            (None, Some(second)) => {
+                if exceeded(second) {
+                    SequenceAssignment::EditDistanceLimit
+                } else {
+                    SequenceAssignment::Consensus2
+                }
+            },
+            // both exist, so now match on if either or both are exceeded
+            (Some(first), Some(second)) => match (exceeded(first), exceeded(second)) {
+                (true, true) => SequenceAssignment::EditDistanceLimit,
+                (true, false) => SequenceAssignment::Consensus2,
+                (false, true) => SequenceAssignment::Consensus1,
+                // both are not exceeded, so final comparison on the actual exact scores
+                (false, false) => match score(first).cmp(&score(second)) {
+                    Ordering::Equal => SequenceAssignment::EqualScore,
+                    Ordering::Less => SequenceAssignment::Consensus1,
+                    Ordering::Greater => SequenceAssignment::Consensus2,
+                },
+            },
+            (None, None) => panic!("Finalize produced a sequence with no DWFA"),
+        }
+    }
+
     /// Returns the total score for the node
     fn total_cost(&self, consensus_cost: ConsensusCost) -> usize {
-        let (_best_indices, best_costs) = self.costs(consensus_cost);
-        best_costs.iter().sum()
+        // same as summing the scores from `costs()`, without the allocations
+        self.dwfas1.iter().zip(self.dwfas2.iter())
+            .map(|(opt_d1, opt_d2)| {
+                [opt_d1, opt_d2].into_iter()
+                    .flatten()
+                    .map(|d| match consensus_cost {
+                        ConsensusCost::L1Distance => d.edit_distance(),
+                        ConsensusCost::L2Distance => d.edit_distance().pow(2)
+                    })
+                    .min()
+                    // a sequence without a DWFA has not been activated yet, and costs 0
+                    .unwrap_or(0)
+            })
+            .sum()
     }
 
     /// Returns the full set of tracked costs for the two consensuses.
@@ -1156,17 +1361,6 @@ impl DualConsensusNode {
         (s1, s2)
     }
 
-    /// Returns the node priority.
-    /// Currently, this is based on 1) lowest cost and 2) consensus length.
-    /// # Arguments
-    /// * `consensus_cost` - cost model to evaluate the cost
-    fn priority(&self, consensus_cost: ConsensusCost) -> NodePriority {
-        (
-            Reverse(self.total_cost(consensus_cost)),
-            self.max_consensus_length()
-        )
-    }
-
     /// Returns true if each consensus has at least one DWFA at the end of their respective baseline sequences.
     /// # Arguments
     /// * `baseline_sequences` - the sequences that are fixed that we want the consensus of
@@ -1179,11 +1373,33 @@ impl DualConsensusNode {
                 // assert!(opt_dwfa1.is_some() || opt_dwfa2.is_some());
                 // these can be None if either A) this one has not started or B) it has started, but dropped off due to high ED
                 // in either case, it would default to NOT at end (i.e., false)
-                let p1 = opt_dwfa1.as_ref().map(|d| d.reached_baseline_end(baseline));
-                let p2 = opt_dwfa2.as_ref().map(|d| d.reached_baseline_end(baseline));
+                // a capped DWFA is ignored: it does not count as finished, and it does not block when every read must finish
+                let mut saw_active = false; // true if either DWFA is active
+                let mut at_end = false; // true if saw_active AND it has reached the baseline end
+                for opt_dwfa in [opt_dwfa1, opt_dwfa2] {
+                    if let Some(dwfa) = opt_dwfa.as_ref().filter(|d| d.state() != DWFALiteState::ExceededEditDistanceLimit) {
+                        saw_active = true;
+                        if dwfa.reached_baseline_end(baseline) {
+                            at_end = true;
+                        }
+                    }
+                }
 
-                // at least one of them needs to be at the end to pass; untracked does not count
-                p1.unwrap_or(false) || p2.unwrap_or(false)
+                if saw_active {
+                    // we saw an active DWFA, so return the normal end check result for this sequence
+                    at_end
+                } else {
+                    // we did not see an active DWFA, so we need to check if they are distance capped
+                    let any_capped = [opt_dwfa1, opt_dwfa2].iter().any(|opt| {
+                        opt.as_ref().is_some_and(|d| d.state() == DWFALiteState::ExceededEditDistanceLimit)
+                    });
+
+                    // if the DWFAs are distance capped:
+                    // - if we require all, then we do not want to penalize; so it should be True
+                    // - if not, then we don't want to count it as reached; so it should be False
+                    // the following logic handles this appropriately
+                    any_capped && require_all
+                }
             });
         
         // handle iterator appropriately
@@ -1192,6 +1408,32 @@ impl DualConsensusNode {
         } else {
             iter_map.any(|b| b)
         }
+    }
+
+    /// `reached_all_end()`, but without a pass over the reads when no DWFA can be at its end
+    /// # Arguments
+    /// * `baseline_sequences` - the sequences that are fixed that we want the consensus of
+    /// * `require_all` - if True, requires *all* of the sequences to be at their end in at least one of the consensuses (this is useful for allow_early_termination)
+    fn reached_all_end_quick(&self, baseline_sequences: &[&[u8]], require_all: bool) -> bool {
+        // without `require_all`, a read must have a DWFA at its end
+        if !require_all && !self.maybe_at_end1 && !self.maybe_at_end2 {
+            return false;
+        }
+        self.reached_all_end(baseline_sequences, require_all)
+    }
+
+    /// `reached_consensus_end()`, but without a pass over the reads when no DWFA of the consensus can be at its end
+    /// # Arguments
+    /// * `baseline_sequences` - the sequences that are fixed that we want the consensus of
+    /// * `is_consensus1` - if True, this will check consensus1 DWFAs, otherwise it checks those for consensus2
+    /// * `require_all` - if True, this requires all active DWFAs to be at the end
+    fn reached_consensus_end_quick(&self, baseline_sequences: &[&[u8]], is_consensus1: bool, require_all: bool) -> bool {
+        // without `require_all`, an active DWFA of the consensus must be at its end
+        let maybe_at_end = if is_consensus1 { self.maybe_at_end1 } else { self.maybe_at_end2 };
+        if !require_all && !maybe_at_end {
+            return false;
+        }
+        self.reached_consensus_end(baseline_sequences, is_consensus1, require_all)
     }
 
     /// For the given consensus, returns true if at least one *active* DWFA at the end of the baseline sequences.
@@ -1220,9 +1462,11 @@ impl DualConsensusNode {
         // iterate over each DWFA and check if it's at the end
         let mut iter_map = baseline_sequences.iter().zip(dwfa_iter)
             .map(|(&baseline, opt_dwfa)| {
-                opt_dwfa.as_ref()
-                    .map(|d| d.reached_baseline_end(baseline))
-                    .unwrap_or(value_for_inactive)
+                match opt_dwfa.as_ref() {
+                    Some(dwfa) if dwfa.state() == DWFALiteState::ExceededEditDistanceLimit => require_all,
+                    Some(dwfa) => dwfa.reached_baseline_end(baseline),
+                    None => value_for_inactive,
+                }
             });
         
         if require_all {
@@ -1232,14 +1476,22 @@ impl DualConsensusNode {
         }
     }
 
-    /// Returns a hashmap of the extension candidates with their votes.
+    /// Writes the extension candidates with their votes into `candidates`, in the iteration order of the
+    /// candidate map that this function returned before.
     /// The votes are fractional if a sequence has multiple equally likely options.
     /// # Arguments
     /// * `baseline_sequences` - the sequences that are fixed that we want the consensus of
     /// * `wildcard` - an optional wildcard character, will be removed from return set unless it is the only value in it
     /// * `is_consensus1` - if True, this will check consensus1 DWFAs, otherwise it checks those for consensus2
     /// * `weighted_by_ed` - if True, then the weights are scaled based on the dual weights comparison; e.g. if ed1 = 2 and ed2 = 4, then weights for consensus 1 are ~1/3 and for consensus 2 are ~2/3 of the total
-    fn get_extension_candidates(&self, baseline_sequences: &[&[u8]], wildcard: Option<u8>, is_consensus1: bool, weighted_by_ed: bool) -> HashMap<u8, f64> {
+    /// * `votes` - accumulated extension votes; cleared first
+    /// * `scratch` - symbol and count buffers for one DWFA
+    /// * `candidates` - output buffer; it is cleared first
+    #[allow(clippy::too_many_arguments)]
+    fn get_extension_candidates(
+        &self, baseline_sequences: &[&[u8]], wildcard: Option<u8>, is_consensus1: bool, weighted_by_ed: bool,
+        votes: &mut ExtensionVotes, scratch: &mut VoteScratch, candidates: &mut Vec<(u8, f64)>
+    ) {
         // get the relevant DWFAs
         let dwfa_iter = if is_consensus1 {
             self.dwfas1.iter()
@@ -1254,45 +1506,34 @@ impl DualConsensusNode {
             &self.consensus2
         };
 
+        // without ED weighting, every weight is 1.0
         let weights = if weighted_by_ed {
-            self.get_ed_weights(is_consensus1, weighted_by_ed)
+            Some(self.get_ed_weights(is_consensus1, weighted_by_ed))
         } else {
-            // these weights will always factor in current scoring
-            vec![1.0; self.dwfas1.len()]
+            None
         };
 
         // now pull out all the candidates and count how many times they were voted on
-        let mut candidates: HashMap<u8, f64> = Default::default();
-        for ((&baseline_seq, opt_dwfa), &weight) in baseline_sequences.iter().zip(dwfa_iter).zip(weights.iter()) {
+        votes.clear();
+        for (seq_index, (&baseline_seq, opt_dwfa)) in baseline_sequences.iter().zip(dwfa_iter).enumerate() {
+            let weight = weights.as_ref().map_or(1.0, |w| w[seq_index]);
             if weight > 0.0 {
                 if let Some(dwfa) = opt_dwfa {
-                    // get the candidates and the total observation weight
-                    let cand = dwfa.get_extension_candidates(baseline_seq, consensus_seq);
-                    let vote_split = cand.values().sum::<usize>() as f64;
-                    
-                    // iterate over each candidate and scale it by the occurrences count / total weight
-                    for (&c, &occ) in cand.iter() {
-                        let entry = candidates.entry(c).or_insert(0.0);
-                        *entry += weight * occ as f64 / vote_split;
-                    }
+                    // each DWFA splits one weighted vote over the symbols it nominates
+                    dwfa.vote(baseline_seq, consensus_seq, weight, votes, scratch);
                 }
             }
         }
 
-        if let Some(wc) = wildcard {
-            if candidates.len() > 1 {
-                // we have 2+ candidates, we can safely remove the wildcard and have something left over
-                candidates.remove(&wc);
-            }
-        }
-
-        candidates
+        // with 2+ candidates, the wildcard is removed, so something is left over
+        votes.candidates(wildcard, candidates);
     }
 
     /// This returns a series of weights that are scaled based on the edit distances to con1 and con2.
     /// For example, if ed1 = 2 and ed2 = 5, then a consensus1 scaled ed would be ~ 5 / (2+5).
     /// Conversely, the weight for consensus2 would be ~ 2 / (2+5).
     /// If `weight_by_ed` is False, this will instead just return 0.0, 0.5, or 1.0; giving full weight when one consensus is better.
+    /// Cap-exceeded alignments are treated as untracked, so a surviving alignment retains its full weight.
     /// # Arguments
     /// * `is_consensus` - If True, then return weights for consensus 1, otherwise consensus 2.
     /// * `weight_by_ed` - If True, then weights are scaled by the relative edit distances. If False, then weights are either 0.0 or 1.0 typically, with 0.5 when equal.
@@ -1303,8 +1544,10 @@ impl DualConsensusNode {
             let equality_score = 0.5; // using 0.0 means don't let something that isn't for sure mapped here have a vote
             self.dwfas1.iter().zip(self.dwfas2.iter())
                 .map(|(d1, d2)| {
-                    let c1 = d1.as_ref().map(|d| (d.edit_distance() as f64).max(min_ed));
-                    let c2 = d2.as_ref().map(|d| (d.edit_distance() as f64).max(min_ed));
+                    let c1 = d1.as_ref().filter(|d| d.state() != DWFALiteState::ExceededEditDistanceLimit)
+                        .map(|d| (d.edit_distance() as f64).max(min_ed));
+                    let c2 = d2.as_ref().filter(|d| d.state() != DWFALiteState::ExceededEditDistanceLimit)
+                        .map(|d| (d.edit_distance() as f64).max(min_ed));
                     
                     if let (Some(v1), Some(v2)) = (c1, c2) {
                         if weight_by_ed {
@@ -1347,27 +1590,73 @@ impl DualConsensusNode {
     fn is_con2_locked(&self) -> bool {
         self.is_con2_locked
     }
+
+    /// Rank cached for the search heap: lower cost, then longer consensus, then earlier tie-breaker.
+    fn queued_priority(&self) -> NodePriority {
+        self.queued_priority
+    }
+}
+
+impl CachePriority for DualConsensusNode {
+    /// Caches this node's search priority.
+    /// Rank is 1) lowest cost, 2) consensus length, and 3) earlier tie-breaker.
+    fn cache_priority(&mut self, consensus_cost: ConsensusCost, tie_breaker: u64) {
+        self.queued_priority = (
+            Reverse(self.total_cost(consensus_cost)),
+            self.max_consensus_length(),
+            Reverse(tie_breaker),
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BinaryHeap;
 
     use std::path::PathBuf;
 
     use crate::cdwfa_config::CdwfaConfigBuilder;
 
     // first some more targeted tests
+    /// Checks that a lower cost wins, and equal costs prefer an earlier tie-breaker.
+    #[test]
+    fn test_heap_orders_by_priority_then_id() {
+        let sequences: [&[u8]; 1] = [b""];
+        let offsets = vec![None];
+        let config = CdwfaConfig::default();
+        let mut earlier = DualConsensusNode::new_root_node(&sequences, &offsets, &config).unwrap();
+        let mut later = DualConsensusNode::new_root_node(&sequences, &offsets, &config).unwrap();
+        let mut cheaper = DualConsensusNode::new_root_node(&sequences, &offsets, &config).unwrap();
+        earlier.queued_priority = (Reverse(1), 0, Reverse(0));
+        later.queued_priority = (Reverse(1), 0, Reverse(1));
+        cheaper.queued_priority = (Reverse(0), 0, Reverse(2));
+
+        let mut heap = BinaryHeap::new();
+        heap.push(later);
+        heap.push(earlier);
+        heap.push(cheaper);
+
+        assert_eq!(heap.pop().unwrap().queued_priority().2.0, 2);
+        assert_eq!(heap.pop().unwrap().queued_priority().2.0, 0);
+        assert_eq!(heap.pop().unwrap().queued_priority().2.0, 1);
+    }
+
+    /// Checks that edit-distance weights split a read between the two alleles, and the unweighted mode gives the better allele full weight.
     #[test]
     fn test_get_ed_weights() {
-        let vec_sequences = vec![
+        let vec_sequences = [
             b"ACGT".to_vec(),
-            b"CGTA".to_vec()
+            b"CGTA".to_vec(),
         ];
         let sequences: Vec<&[u8]> = vec_sequences.iter().map(|v| v.as_slice()).collect();
         let offsets = vec![None; sequences.len()];
 
-        let mut node = DualConsensusNode::new_root_node(&offsets, None, true).unwrap();
+        let config = CdwfaConfigBuilder::default()
+            .allow_early_termination(true)
+            .build()
+            .unwrap();
+        let mut node = DualConsensusNode::new_root_node(&sequences, &offsets, &config).unwrap();
         node.activate_dual(sequences.as_slice(), b'A', b'C').unwrap();
 
         let weights1 = node.get_ed_weights(true, true);
@@ -1399,7 +1688,7 @@ mod tests {
     /// * `cost_mode` - the cost mode getting tested
     fn load_dual_csv_test(filename: &std::path::Path, include_consensus: bool, cost_mode: ConsensusCost) -> (Vec<Vec<u8>>, DualConsensus) {
         let mut sequences = vec![];
-        let mut is_consensus1 = vec![];
+        let mut assignments = vec![];
         let mut ed1 = vec![];
         let mut ed2 = vec![];
 
@@ -1440,19 +1729,23 @@ mod tests {
                 ed2.push(edits);
             }
 
-            is_consensus1.push(is_con1);
+            assignments.push(if is_con1 {
+                SequenceAssignment::Consensus1
+            } else {
+                SequenceAssignment::Consensus2
+            });
             sequences.push(sequence);
         }
 
         // make sure that either we do not have consensus 2 OR consensus 1 comes before consensus 2
         assert!(con2.is_none() || con1.as_ref().unwrap() < con2.as_ref().unwrap());
 
-        let consensus1 = Consensus::new(con1.unwrap(), cost_mode, ed1);
-        let consensus2 = con2.map(|c2| Consensus::new(c2, cost_mode, ed2));
+        let consensus1 = Consensus::new(con1.unwrap(), cost_mode, ed1, None).unwrap();
+        let consensus2 = con2.map(|c2| Consensus::new(c2, cost_mode, ed2, None).unwrap());
         let consensus = DualConsensus {
             consensus1,
             consensus2,
-            is_consensus1,
+            assignments,
             scores1: vec![None; sequences.len()],
             scores2: vec![None; sequences.len()]
         };
@@ -1488,6 +1781,7 @@ mod tests {
         assert_eq!(consensus, vec![expected_consensus]);
     }
 
+    /// Checks that one exact input is returned as a single consensus with score 0.
     #[test_log::test]
     fn test_single_sequence() {
         // the sequence
@@ -1504,16 +1798,18 @@ mod tests {
             consensus1: Consensus::new(
                 sequence.to_vec(),
                 ConsensusCost::L1Distance,
-                vec![0]
-            ),
+                vec![0],
+                None,
+            ).unwrap(),
             consensus2: None,
-            is_consensus1: vec![true],
+            assignments: vec![SequenceAssignment::Consensus1],
             // these are not checked
             scores1: vec![],
             scores2: vec![]
         }]);
     }
 
+    /// Checks that the majority sequence is the unique consensus when one read differs by one edit.
     #[test]
     fn test_trio_sequence() {
         let sequence = b"ACGTACGTACGT";
@@ -1536,16 +1832,18 @@ mod tests {
             consensus1: Consensus::new(
                 sequence.to_vec(),
                 ConsensusCost::L1Distance,
-                vec![0, 0, 1]
-            ),
+                vec![0, 0, 1],
+                None,
+            ).unwrap(),
             consensus2: None,
-            is_consensus1: vec![true, true, true],
+            assignments: vec![SequenceAssignment::Consensus1; 3],
             // these are not checked
             scores1: vec![],
             scores2: vec![]
         }]);
     }
 
+    /// Checks that three indel-divergent reads recover a single intermediate consensus.
     #[test]
     fn test_complicated() {
         let expected_consensus = b"ACGTACGTACGT";
@@ -1572,15 +1870,16 @@ mod tests {
         let consensus = consensus_dwfa.consensus().unwrap();
         // assert_eq!(consensus.len(), 1);
         assert_eq!(consensus, vec![DualConsensus {
-            consensus1: Consensus::new(expected_consensus.to_vec(), ConsensusCost::L1Distance, vec![2, 2, 1]),
+            consensus1: Consensus::new(expected_consensus.to_vec(), ConsensusCost::L1Distance, vec![2, 2, 1], None).unwrap(),
             consensus2: None,
-            is_consensus1: vec![true; 3],
+            assignments: vec![SequenceAssignment::Consensus1; 3],
             // these are not checked
             scores1: vec![],
             scores2: vec![]
         }]);
     }
 
+    /// Checks that wildcard bases are ignored for the alphabet and for edit scoring.
     #[test]
     fn test_wildcards() {
         let expected_consensus = b"ACGTACGTACGT";
@@ -1610,15 +1909,16 @@ mod tests {
         let consensus = consensus_dwfa.consensus().unwrap();
         // assert_eq!(consensus.len(), 1);
         assert_eq!(consensus, vec![DualConsensus {
-            consensus1: Consensus::new(expected_consensus.to_vec(), ConsensusCost::L1Distance, vec![1, 1, 0]),
+            consensus1: Consensus::new(expected_consensus.to_vec(), ConsensusCost::L1Distance, vec![1, 1, 0], None).unwrap(),
             consensus2: None,
-            is_consensus1: vec![true; 3],
+            assignments: vec![SequenceAssignment::Consensus1; 3],
             // these are not checked
             scores1: vec![],
             scores2: vec![]
         }]);
     }
 
+    /// Checks that a lone wildcard remains a candidate when every read nominates it.
     #[test]
     fn test_all_wildcards() {
         let _expected_consensus = b"ACGTACGTACGT";
@@ -1649,15 +1949,16 @@ mod tests {
         let consensus = consensus_dwfa.consensus().unwrap();
         // assert_eq!(consensus.len(), 1);
         assert_eq!(consensus, vec![DualConsensus {
-            consensus1: Consensus::new(actual_consensus.to_vec(), ConsensusCost::L1Distance, vec![1, 0, 1]),
+            consensus1: Consensus::new(actual_consensus.to_vec(), ConsensusCost::L1Distance, vec![1, 0, 1], None).unwrap(),
             consensus2: None,
-            is_consensus1: vec![true; 3],
+            assignments: vec![SequenceAssignment::Consensus1; 3],
             // these are not checked
             scores1: vec![],
             scores2: vec![]
         }]);
     }
 
+    /// Checks that two sequences one edit apart become the two alleles, each with score 0.
     #[test]
     fn test_dual_sequence() {
         let sequence     = b"ACGT";
@@ -1676,15 +1977,82 @@ mod tests {
         // now check that the consensus is the same as our sequence
         let consensus = consensus_dwfa.consensus().unwrap();
         assert_eq!(consensus, vec![DualConsensus {
-            consensus1: Consensus::new(sequence.to_vec(), ConsensusCost::L1Distance, vec![0]),
-            consensus2: Some(Consensus::new(alt_sequence.to_vec(), ConsensusCost::L1Distance, vec![0])),
-            is_consensus1: vec![true, false],
+            consensus1: Consensus::new(sequence.to_vec(), ConsensusCost::L1Distance, vec![0], None).unwrap(),
+            consensus2: Some(Consensus::new(alt_sequence.to_vec(), ConsensusCost::L1Distance, vec![0], None).unwrap()),
+            assignments: vec![SequenceAssignment::Consensus1, SequenceAssignment::Consensus2],
             // these are not checked
             scores1: vec![],
             scores2: vec![]
         }]);
     }
 
+    /// Checks that an outlier past the cap on both alleles is labeled `EditDistanceLimit` and omitted from both score lists.
+    #[test]
+    fn test_edit_distance_limit_on_both_alleles() {
+        let allele1 = b"AAAAAAAA";
+        let allele2 = b"CCCCCCCC";
+        let outlier = b"TTTTTTTT";
+        let mut consensus_dwfa = DualConsensusDWFA::with_config(
+            CdwfaConfigBuilder::default()
+                .min_count(2)
+                .max_edit_distance(Some(1))
+                .build().unwrap()
+        ).unwrap();
+        consensus_dwfa.add_sequence(allele1).unwrap();
+        consensus_dwfa.add_sequence(allele1).unwrap();
+        consensus_dwfa.add_sequence(allele2).unwrap();
+        consensus_dwfa.add_sequence(allele2).unwrap();
+        consensus_dwfa.add_sequence(outlier).unwrap();
+
+        let consensus = consensus_dwfa.consensus().unwrap();
+        assert_eq!(consensus.len(), 1);
+        assert_eq!(consensus[0].consensus1().sequence(), allele1);
+        assert_eq!(consensus[0].consensus2().unwrap().sequence(), allele2);
+        assert_eq!(consensus[0].assignments(), &[
+            SequenceAssignment::Consensus1,
+            SequenceAssignment::Consensus1,
+            SequenceAssignment::Consensus2,
+            SequenceAssignment::Consensus2,
+            SequenceAssignment::EditDistanceLimit,
+        ]);
+        // the outlier is omitted from both allele score lists
+        assert_eq!(consensus[0].consensus1().scores(), &[0, 0]);
+        assert_eq!(consensus[0].consensus2().unwrap().scores(), &[0, 0]);
+    }
+
+    /// Checks that a hard cap labels an outlier without splitting when the other reads agree.
+    #[test]
+    fn test_edit_distance_limit_without_split() {
+        let good = b"ACGTACGTACGT";
+        let bad = b"TTTTTTTTTTTT";
+        let mut consensus_dwfa = DualConsensusDWFA::with_config(
+            CdwfaConfigBuilder::default()
+                .max_edit_distance(Some(3))
+                .build().unwrap()
+        ).unwrap();
+        for _ in 0..5 {
+            consensus_dwfa.add_sequence(good).unwrap();
+        }
+        consensus_dwfa.add_sequence(bad).unwrap();
+
+        let consensus = consensus_dwfa.consensus().unwrap();
+        assert_eq!(consensus.len(), 1);
+        assert!(consensus[0].consensus2().is_none());
+        assert_eq!(consensus[0].consensus1().sequence(), good);
+        assert_eq!(consensus[0].assignments(), &[
+            SequenceAssignment::Consensus1,
+            SequenceAssignment::Consensus1,
+            SequenceAssignment::Consensus1,
+            SequenceAssignment::Consensus1,
+            SequenceAssignment::Consensus1,
+            SequenceAssignment::EditDistanceLimit,
+        ]);
+        assert_eq!(consensus[0].consensus1().scores(), &[0, 0, 0, 0, 0]);
+        assert_eq!(consensus[0].consensus1().assignments(), None);
+        assert_eq!(consensus[0].scores1()[5], Some(3));
+    }
+
+    /// Checks that a substitution plus a trailing base still splits into two zero-cost alleles.
     #[test]
     fn test_dual_unequal_001() {
         let sequence     = b"ACGT";
@@ -1703,15 +2071,16 @@ mod tests {
         // now check that the consensus is the same as our sequence
         let consensus = consensus_dwfa.consensus().unwrap();
         assert_eq!(consensus, vec![DualConsensus {
-            consensus1: Consensus::new(sequence.to_vec(), ConsensusCost::L1Distance, vec![0]),
-            consensus2: Some(Consensus::new(alt_sequence.to_vec(), ConsensusCost::L1Distance, vec![0])),
-            is_consensus1: vec![true, false],
+            consensus1: Consensus::new(sequence.to_vec(), ConsensusCost::L1Distance, vec![0], None).unwrap(),
+            consensus2: Some(Consensus::new(alt_sequence.to_vec(), ConsensusCost::L1Distance, vec![0], None).unwrap()),
+            assignments: vec![SequenceAssignment::Consensus1, SequenceAssignment::Consensus2],
             // these are not checked
             scores1: vec![],
             scores2: vec![]
         }]);
     }
 
+    /// Checks that a shorter second allele with one substitution still splits into two zero-cost alleles.
     #[test]
     fn test_dual_unequal_002() {
         let sequence     = b"ACGTA";
@@ -1730,15 +2099,16 @@ mod tests {
         // now check that the consensus is the same as our sequence
         let consensus = consensus_dwfa.consensus().unwrap();
         assert_eq!(consensus, vec![DualConsensus {
-            consensus1: Consensus::new(sequence.to_vec(), ConsensusCost::L1Distance, vec![0]),
-            consensus2: Some(Consensus::new(alt_sequence.to_vec(), ConsensusCost::L1Distance, vec![0])),
-            is_consensus1: vec![true, false],
+            consensus1: Consensus::new(sequence.to_vec(), ConsensusCost::L1Distance, vec![0], None).unwrap(),
+            consensus2: Some(Consensus::new(alt_sequence.to_vec(), ConsensusCost::L1Distance, vec![0], None).unwrap()),
+            assignments: vec![SequenceAssignment::Consensus1, SequenceAssignment::Consensus2],
             // these are not checked
             scores1: vec![],
             scores2: vec![]
         }]);
     }
 
+    /// Checks that a noisy insertion before the real split is corrected once the consistent substitutions are reached.
     #[test]
     fn test_dual_noise_before_variation() {
         // this test includes a noisy C insertion; it will cause a dual node split that get's corrected later when the true variation is reached
@@ -1770,15 +2140,23 @@ mod tests {
         // now check that the consensus is the same as our sequence
         let consensus = consensus_dwfa.consensus().unwrap();
         assert_eq!(consensus, vec![DualConsensus {
-            consensus1: Consensus::new(con1.to_vec(), ConsensusCost::L1Distance, vec![0, 1, 0]),
-            consensus2: Some(Consensus::new(con2.to_vec(), ConsensusCost::L1Distance, vec![0, 0, 1])),
-            is_consensus1: vec![true, true, true, false, false, false],
+            consensus1: Consensus::new(con1.to_vec(), ConsensusCost::L1Distance, vec![0, 1, 0], None).unwrap(),
+            consensus2: Some(Consensus::new(con2.to_vec(), ConsensusCost::L1Distance, vec![0, 0, 1], None).unwrap()),
+            assignments: vec![
+                SequenceAssignment::Consensus1,
+                SequenceAssignment::Consensus1,
+                SequenceAssignment::Consensus1,
+                SequenceAssignment::Consensus2,
+                SequenceAssignment::Consensus2,
+                SequenceAssignment::Consensus2,
+            ],
             // these are not checked
             scores1: vec![],
             scores2: vec![]
         }]);
     }
 
+    /// Checks that three or more extension candidates still recover the two supported alleles.
     #[test]
     fn test_multi_extension() {
         // test the scenario where 3+ extensions are identified
@@ -1812,15 +2190,23 @@ mod tests {
         // now check that the consensus is the same as our sequence
         let consensus = consensus_dwfa.consensus().unwrap();
         assert_eq!(consensus, vec![DualConsensus {
-            consensus1: Consensus::new(con1.to_vec(), ConsensusCost::L1Distance, vec![0, 0, 1]),
-            consensus2: Some(Consensus::new(con2.to_vec(), ConsensusCost::L1Distance, vec![0, 0, 1])),
-            is_consensus1: vec![true, true, true, false, false, false],
+            consensus1: Consensus::new(con1.to_vec(), ConsensusCost::L1Distance, vec![0, 0, 1], None).unwrap(),
+            consensus2: Some(Consensus::new(con2.to_vec(), ConsensusCost::L1Distance, vec![0, 0, 1], None).unwrap()),
+            assignments: vec![
+                SequenceAssignment::Consensus1,
+                SequenceAssignment::Consensus1,
+                SequenceAssignment::Consensus1,
+                SequenceAssignment::Consensus2,
+                SequenceAssignment::Consensus2,
+                SequenceAssignment::Consensus2,
+            ],
             // these are not checked
             scores1: vec![],
             scores2: vec![]
         }]);
     }
 
+    /// Checks that four equally supported alleles return six dual consensuses, each with total cost 2.
     #[test]
     fn test_equal_options() {
         // test the scenario multiple possible dual consensuses are possible
@@ -1855,13 +2241,23 @@ mod tests {
         for dc in consensus.iter() {
             // make sure it's dual
             assert!(dc.consensus2.is_some());
-            // make sure the edits are 2
-            assert_eq!(2, dc.consensus1.scores().iter().sum::<usize>()+dc.consensus2.as_ref().unwrap().scores().iter().sum::<usize>());
-            
-            // future: if we need to test the exact result, we're going to have to add it by hand later
+            // allele score lists omit equal-score reads, so add those distances once
+            let assigned = dc.consensus1.scores().iter().sum::<usize>()
+                + dc.consensus2.as_ref().unwrap().scores().iter().sum::<usize>();
+            let tied = dc.assignments.iter().zip(dc.scores1.iter()).zip(dc.scores2.iter())
+                .filter(|((assignment, _), _)| **assignment == SequenceAssignment::EqualScore)
+                .map(|((_, score1), score2)| {
+                    let score1 = score1.expect("equal-score read is tracked on allele 1");
+                    let score2 = score2.expect("equal-score read is tracked on allele 2");
+                    assert_eq!(score1, score2);
+                    score1
+                })
+                .sum::<usize>();
+            assert_eq!(2, assigned + tied);
         }
     }
 
+    /// Checks that a one-base tail difference stays a single consensus and returns both lengths.
     #[test]
     fn test_tail_extension() {
         // test the scenario we have a simple tail extension
@@ -1891,28 +2287,86 @@ mod tests {
         // now check that the consensus is the same as our sequence
         let consensus = consensus_dwfa.consensus().unwrap();
         assert_eq!(consensus, vec![DualConsensus {
-            consensus1: Consensus::new(con1.to_vec(), ConsensusCost::L1Distance, vec![0, 1]),
+            consensus1: Consensus::new(con1.to_vec(), ConsensusCost::L1Distance, vec![0, 1], None).unwrap(),
             consensus2: None,
-            is_consensus1: vec![true, true],
+            assignments: vec![SequenceAssignment::Consensus1, SequenceAssignment::Consensus1],
             // these are not checked
             scores1: vec![],
             scores2: vec![]
         }, 
         DualConsensus {
-            consensus1: Consensus::new(con2.to_vec(), ConsensusCost::L1Distance, vec![1, 0]),
+            consensus1: Consensus::new(con2.to_vec(), ConsensusCost::L1Distance, vec![1, 0], None).unwrap(),
             consensus2: None,
-            is_consensus1: vec![true, true],
+            assignments: vec![SequenceAssignment::Consensus1, SequenceAssignment::Consensus1],
             // these are not checked
             scores1: vec![],
             scores2: vec![]
         }]);
     }
 
+    /// Checks the `dual_001.csv` reads against their recorded alleles.
     #[test]
     fn test_csv_dual_001() {
         run_test_file("./tests/dual_001.csv", true, None);
     }
 
+    /// Checks that a capped competitor keeps its full vote so a supported one-read allele still meets `min_count`.
+    #[test]
+    fn test_weighted_capped_competitor_preserves_supported_consensus() {
+        use SequenceAssignment::{Consensus1, Consensus2, EditDistanceLimit};
+
+        // Changing the other allele's support exercises either internal allele ordering.
+        for other_count in [2, 4] {
+            let mut reads: Vec<&[u8]> = vec![b"ACCA", b"ACCG", b"ACTT"];
+            reads.extend(std::iter::repeat_n(b"GTGG".as_slice(), other_count));
+
+            for weighted in [false, true] {
+                let config = CdwfaConfigBuilder::default()
+                    .max_edit_distance(Some(1))
+                    .min_count(1)
+                    .weighted_by_ed(weighted)
+                    .build().unwrap();
+                let mut engine = DualConsensusDWFA::with_config(config).unwrap();
+                for &read in &reads {
+                    engine.add_sequence(read).unwrap();
+                }
+
+                // At AC / GT, each read has exceeded the cap on the opposite allele.
+                // ACTT's next T must retain its full vote to meet min_count=1.
+                // All three A-starting consensuses have the same capped total cost.
+                let fixtures = [
+                    (b"ACCA", &[0, 1][..], [Consensus1, Consensus1, EditDistanceLimit], [0, 1, 1]),
+                    (b"ACCG", &[1, 0][..], [Consensus1, Consensus1, EditDistanceLimit], [1, 0, 1]),
+                    (b"ACTT", &[0][..], [EditDistanceLimit, EditDistanceLimit, Consensus1], [1, 1, 0]),
+                ];
+                let expected: Vec<_> = fixtures.iter().map(|&(sequence, scores, assignments, scores1)| {
+                    let mut assignments = assignments.to_vec();
+                    assignments.extend(std::iter::repeat_n(Consensus2, other_count));
+                    let mut scores1: Vec<_> = scores1.into_iter().map(Some).collect();
+                    scores1.extend(std::iter::repeat_n(Some(1), other_count));
+                    let mut scores2 = vec![Some(1); 3];
+                    scores2.extend(std::iter::repeat_n(Some(0), other_count));
+                    DualConsensus::new(
+                        Consensus::new(sequence.to_vec(), ConsensusCost::L1Distance, scores.to_vec(), None).unwrap(),
+                        Some(Consensus::new(b"GTGG".to_vec(), ConsensusCost::L1Distance, vec![0; other_count], None).unwrap()),
+                        assignments,
+                        scores1,
+                        scores2,
+                    ).unwrap()
+                }).collect();
+
+                let actual = engine.consensus().unwrap();
+                assert_eq!(actual, expected, "weighted={weighted}, other_count={other_count}");
+                // DualConsensus equality does not compare the full per-allele score arrays.
+                for (actual, expected) in actual.iter().zip(&expected) {
+                    assert_eq!(actual.scores1(), expected.scores1());
+                    assert_eq!(actual.scores2(), expected.scores2());
+                }
+            }
+        }
+    }
+
+    /// Checks that a zero dual edit-distance delta assigns a read to the worse allele.
     #[test]
     fn test_dual_max_ed_delta() {
         // this is the same test as above BUT we have restricted the dual_max_ed_delta to too low, resulting in one read getting mis-assigned
@@ -1926,14 +2380,27 @@ mod tests {
                 consensus1: Consensus::new(
                     expected_consensus.consensus1.sequence().to_vec(), 
                     ConsensusCost::L1Distance, 
-                    vec![0, 4, 4, 2] // delete the third entry here
-                ),
+                    vec![0, 4, 4, 2], // delete the third entry here
+                    None,
+                ).unwrap(),
                 consensus2: Some(Consensus::new(
                     expected_consensus.consensus2.as_ref().unwrap().sequence().to_vec(), 
                     ConsensusCost::L1Distance,
-                    vec![3, 0, 0, 0, 0, 0] // shift it here, with a worse ED
-                )), 
-                is_consensus1: vec![true, true, false, true, true, false, false, false, false, false], // mark third from true -> false
+                    vec![3, 0, 0, 0, 0, 0], // shift it here, with a worse ED
+                    None,
+                ).unwrap()), 
+                assignments: vec![
+                    SequenceAssignment::Consensus1,
+                    SequenceAssignment::Consensus1,
+                    SequenceAssignment::Consensus2, // mark third from consensus 1 to consensus 2
+                    SequenceAssignment::Consensus1,
+                    SequenceAssignment::Consensus1,
+                    SequenceAssignment::Consensus2,
+                    SequenceAssignment::Consensus2,
+                    SequenceAssignment::Consensus2,
+                    SequenceAssignment::Consensus2,
+                    SequenceAssignment::Consensus2,
+                ],
                 // these are not checked
                 scores1: vec![],
                 scores2: vec![]
@@ -1959,6 +2426,7 @@ mod tests {
         assert_eq!(consensus, expected_consensus);
     }
 
+    /// Checks `length_gap_001.csv` under L2 cost with a length gap and a dual edit-distance delta.
     #[test]
     fn test_csv_length_gap_001() {
         run_test_file("./tests/length_gap_001.csv", false, Some(
@@ -1972,6 +2440,7 @@ mod tests {
         ));
     }
 
+    /// Checks that early termination recovers the `dual_early_termination_001.csv` alleles from prefix-truncated reads.
     #[test]
     fn test_csv_early_termination_001() {
         run_test_file("./tests/dual_early_termination_001.csv", true, Some(
@@ -1982,6 +2451,7 @@ mod tests {
         ));
     }
 
+    /// Checks that offset windows place delayed starts so every read scores 0.
     #[test]
     fn test_offset_windows() {
         // this test is _only_ for verifying that our offsets are getting correctly adjust to match
@@ -2005,8 +2475,8 @@ mod tests {
                 .offset_compare_length(4) // semi-arbitrary, just needs to be short here given our seq-len
                 .build().unwrap()
         ).unwrap();
-        for (sequence, offset) in sequences.iter().zip(offsets.iter()) {
-            consensus_dwfa.add_sequence_offset(sequence, offset.clone()).unwrap();
+        for (sequence, offset) in sequences.iter().zip(offsets.iter().cloned()) {
+            consensus_dwfa.add_sequence_offset(sequence, offset).unwrap();
         }
 
         // make sure our alphabet has four symbols, ACGT
@@ -2020,6 +2490,7 @@ mod tests {
         assert_eq!(&[0, 0, 0], consensus[0].consensus1().scores());
     }
 
+    /// Checks that a start far past activation leaves a DWFA uninitialized and fails finalize.
     #[test]
     fn test_offset_gap_err() {
         // this test is _only_ for verifying that our offsets are getting correctly adjust to match
@@ -2040,8 +2511,8 @@ mod tests {
                 .offset_compare_length(4) // semi-arbitrary, just needs to be short here given our seq-len
                 .build().unwrap()
         ).unwrap();
-        for (sequence, offset) in sequences.iter().zip(offsets.iter()) {
-            consensus_dwfa.add_sequence_offset(sequence, offset.clone()).unwrap();
+        for (sequence, offset) in sequences.iter().zip(offsets.iter().cloned()) {
+            consensus_dwfa.add_sequence_offset(sequence, offset).unwrap();
         }
 
         // make sure our alphabet has four symbols, ACGT

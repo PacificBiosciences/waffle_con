@@ -11,10 +11,7 @@
 ## Breaking changes
 * `Consensus::new` now takes per-read assignments and returns a `Result`
 * `DualConsensus::new` takes `Vec<SequenceAssignment>` instead of `Vec<bool>`, and `is_consensus1()` is replaced by `assignments()`
-* `DWFALite::new` takes a `DWFALiteConfig` instead of a wildcard and an early-termination flag
-* `DWFALite::update` returns `(edit_distance, Option<u8>)` instead of the edit distance alone. The symbol is the next baseline base when a single frontier diagonal advanced and another base remains.
-* `DWFALite::get_extension_candidates` is no longer public
-* Tie-breaking order has changed. Equal extension votes follow the order each symbol is first seen, and equal-cost search nodes keep the earlier one, so results can differ when no symbol dominates.
+* Tie-breaking order has changed. Equal extension votes follow the order each symbol is first seen. Search nodes prefer lower cost, then longer consensus, then earlier insertion, so results can differ when no symbol dominates.
 
 # v0.4.4
 ## Bugs

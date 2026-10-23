@@ -4,7 +4,7 @@ use simple_error::bail;
 use super::dwfa_config::DWFALiteConfig;
 use super::votes::{ExtensionVotes, VoteScratch, VoteSymbols};
 use super::wavefront::{
-    grow_wavefront, grow_wide_wavefront, grow_without_matches, match_length, WavefrontGrower, FRONTIER_BITS,
+    grow_wavefront, grow_wide_wavefront, grow_without_matches, match_length, WavefrontGrower, NARROW_GROWTH_LIMIT,
 };
 
 /// Lifecycle of a [`DWFALite`].
@@ -55,7 +55,7 @@ pub struct DWFALite {
     /// A diagonal that stopped before this position stopped on a mismatch or the baseline end.
     /// Because `other_seq` only grows, only diagonals at this frontier can extend again.
     extended_len: usize,
-    /// Equality lanes at `extended_len`: an exact narrow mask or enclosing wide bounds.
+    /// Equality lanes at `extended_len`: one exact lane or enclosing wide bounds.
     /// Unknown metadata requires a full scan; it never limits the observable wavefront.
     frontier: Frontier,
 }
@@ -65,11 +65,23 @@ pub struct DWFALite {
 enum Frontier {
     /// The bounds were not computed. The next extension visits every diagonal.
     Unknown,
-    /// Bit `i` is set when diagonal `i` is at `extended_len`.
-    Narrow(u128),
+    /// The only equality lane at `extended_len`.
+    Single(usize),
     /// Smallest half-open range containing every equality lane; holes are filtered on use.
     /// An empty frontier is represented by `start == end == 0`.
     Wide { start: usize, end: usize },
+}
+
+impl Frontier {
+    /// Makes the most precise representation for equality lanes enclosed by `[start, end)`.
+    #[inline]
+    fn from_bounds(start: usize, end: usize) -> Self {
+        if end == start + 1 {
+            Frontier::Single(start)
+        } else {
+            Frontier::Wide { start, end }
+        }
+    }
 }
 
 /// Spare wavefront capacity that a clone gets. Clones are usually extended at once, and each edit adds two diagonals.
@@ -123,7 +135,7 @@ impl Default for DWFALite {
             max_baseline: 0,
             extended_len: 0,
             // the single diagonal is at `other_seq` position 0, which is the frontier
-            frontier: Frontier::Narrow(1),
+            frontier: Frontier::Single(0),
         }
     }
 }
@@ -179,25 +191,23 @@ impl DWFALite {
     /// Returns `None` when this path does not apply and nothing was changed.
     /// Returns `Some` when the diagonal advanced. 
     /// The inner value is the next baseline symbol on that diagonal if it exists, or `None` when the baseline has no further symbol (at end).
-    /// Narrow frontiers retain the low-64-bit shortcut; wide singleton bounds support any lane.
+    /// A `Single` frontier directly names the lane; wide singleton bounds support any lane.
     /// # Arguments
     /// * `baseline_seq` - the baseline sequence, theoretically fixed
     /// * `other_seq` - the other sequence, typically getting updates
     #[inline(always)]
     fn advance_single_frontier(&mut self, baseline_seq: &[u8], other_seq: &[u8]) -> Option<Option<u8>> {
         let i = match self.frontier {
-            Frontier::Narrow(bits) => {
-                let low_bits = bits as u64;
+            Frontier::Single(i) => {
                 // Fall back when any of these is true:
-                // * not active, or the only frontier diagonal sits above bit 63
-                // * zero or several frontier diagonals (`is_power_of_two` rejects 0)
+                // * not active
                 // * `other_seq` did not grow by exactly one byte
                 // * the frontier diagonal is not the cached maximum, so `max_wavefront` is not `wavefront[i]`
-                if self.state != DWFALiteState::Active || (bits >> 64) != 0 || !low_bits.is_power_of_two() ||
+                if self.state != DWFALiteState::Active ||
                     other_seq.len() != self.extended_len + 1 || self.offset + self.max_wavefront != self.extended_len {
                     return None;
                 }
-                low_bits.trailing_zeros() as usize
+                i
             },
             Frontier::Wide { start, end } => {
                 // Fall back unless the bounds name one diagonal, one byte was appended,
@@ -270,10 +280,6 @@ impl DWFALite {
             maximum_distance == other_seq.len() || 
             (self.config.allow_early_termination && self.maximum_baseline_distance() == baseline_seq.len())
         );
-        // Wide growth does not fill a bitmask. Cache the bounds once the wavefront has caught `other_seq`.
-        if self.wavefront.len() > FRONTIER_BITS && matches!(self.frontier, Frontier::Unknown) {
-            self.refresh_wide_frontier(other_seq.len());
-        }
         Ok(self.edit_distance)
     }
 
@@ -299,26 +305,17 @@ impl DWFALite {
 
         match self.frontier {
             // a shorter `other_seq` breaks the append-only contract, so that takes the full path below
-            Frontier::Narrow(mut bits) if other_len >= self.extended_len => {
-                // only the frontier diagonals can move; values only grow, so the cached maxima stay valid lower bounds
-                let mut new_bits: u128 = 0;
-                while bits != 0 {
-                    // get the index of the lowest set bit, and unset it
-                    let i = bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-
-                    // get the diagonal and extend it by the match length
-                    let d = &mut self.wavefront[i];
-                    *d += match_length(baseline_seq, other_seq, *d + edit_distance - i, *d + offset, wildcard);
-
-                    // if the diagonal is at the end, then it is still frontier
-                    if *d + offset == other_len {
-                        new_bits |= 1 << i;
-                    }
-                    self.max_wavefront = self.max_wavefront.max(*d);
-                    self.max_baseline = self.max_baseline.max(*d + edit_distance - i);
-                }
-                self.frontier = Frontier::Narrow(new_bits);
+            Frontier::Single(i) if other_len >= self.extended_len => {
+                // Only this diagonal can move; values only grow, so the cached maxima stay valid lower bounds.
+                let d = &mut self.wavefront[i];
+                *d += match_length(baseline_seq, other_seq, *d + edit_distance - i, *d + offset, wildcard);
+                self.max_wavefront = self.max_wavefront.max(*d);
+                self.max_baseline = self.max_baseline.max(*d + edit_distance - i);
+                self.frontier = if *d + offset == other_len {
+                    Frontier::Single(i)
+                } else {
+                    Frontier::Wide { start: 0, end: 0 }
+                };
             },
             Frontier::Wide { start, end } if other_len >= self.extended_len => {
                 // Only lanes at the previous frontier can move. Holes inside the bounds are skipped.
@@ -347,60 +344,41 @@ impl DWFALite {
                 }
 
                 // update the wide frontier to the new range (can be empty if all failed to extend)
-                self.frontier = Frontier::Wide { start: next_start, end: next_end };
+                self.frontier = Frontier::from_bounds(next_start, next_end);
             },
             // general case when the frontier cannot short circuit
             _ => {
                 let frontier = if other_len < self.extended_len { 0 } else { self.extended_len };
                 let mut max_wavefront = 0;
                 let mut max_baseline = 0;
-                let mut new_bits: u128 = 0;
+                let mut next_start = 0;
+                let mut next_end = 0;
 
                 // go through every diagonal and extend it
                 for (i, d) in self.wavefront.iter_mut().enumerate() {
                     if *d + offset >= frontier {
                         *d += match_length(baseline_seq, other_seq, *d + edit_distance - i, *d + offset, wildcard);
                     }
-                    if i < FRONTIER_BITS && *d + offset == other_len {
-                        new_bits |= 1 << i;
+                    if *d + offset == other_len {
+                        if next_end == 0 {
+                            next_start = i;
+                        }
+                        next_end = i + 1;
                     }
                     max_wavefront = max_wavefront.max(*d);
                     max_baseline = max_baseline.max(*d + edit_distance - i);
                 }
                 self.max_wavefront = max_wavefront;
                 self.max_baseline = max_baseline;
-                self.frontier = if self.wavefront.len() <= FRONTIER_BITS {
-                    Frontier::Narrow(new_bits)
-                } else {
+                self.frontier = if offset + max_wavefront > other_len {
+                    // A lane past the end can extend when `other_seq` catches up, so equality bounds would omit it.
                     Frontier::Unknown
+                } else {
+                    Frontier::from_bounds(next_start, next_end)
                 };
             },
         };
         self.extended_len = other_len;
-    }
-
-    /// Records the half-open bounds of diagonals at `other_len` after an active update.
-    /// Called once the wavefront has caught `other_seq`. Finalization leaves the frontier `Unknown`.
-    /// # Arguments
-    /// * `other_len` - the length of `other_seq` after the update
-    fn refresh_wide_frontier(&mut self, other_len: usize) {
-        if self.offset + self.max_wavefront > other_len {
-            // Overshooting lanes may extend later and cannot be represented by equality-only bounds.
-            self.frontier = Frontier::Unknown;
-            return;
-        }
-
-        // find the first diagonal that is at the end
-        let Some(start) = self.wavefront.iter().position(|&d| d + self.offset == other_len) else {
-            // No diagonal is at the end. `start == end == 0` is the empty wide frontier.
-            self.frontier = Frontier::Wide { start: 0, end: 0 };
-            return;
-        };
-
-        // find the last diagonal that is at the end, then build the range
-        let last = self.wavefront.iter().rposition(|&d| d + self.offset == other_len)
-            .expect("first equality lane remains present");
-        self.frontier = Frontier::Wide { start, end: last + 1 };
     }
 
     /// This will increase the edit distance for this DWFA and create a new larger wavefront.
@@ -424,17 +402,21 @@ impl DWFALite {
         // first, increase the distance we're at
         self.edit_distance += 1;
 
-        // grow and re-extend; the bitmask only pays off for narrow wavefronts, so wide ones skip that work
+        // Grow and re-extend. Small wavefronts grow in place; wider ones use the allocating gather.
+        // Both record equality-lane bounds. A lane past the end of `other_seq` cannot be named that way.
         let (edit_distance, offset, wildcard) = (self.edit_distance, self.offset, self.config.wildcard);
-        let tracked = self.wavefront.len() + 2 <= FRONTIER_BITS;
-        let grown = if tracked {
+        let grown = if self.wavefront.len() + 2 <= NARROW_GROWTH_LIMIT {
             grow_wavefront(&mut self.wavefront, WavefrontGrower::new(baseline_seq, other_seq, edit_distance, offset, wildcard))
         } else {
             grow_wide_wavefront(&mut self.wavefront, baseline_seq, other_seq, edit_distance, offset, wildcard)
         };
         self.max_wavefront = grown.max_wavefront;
         self.max_baseline = grown.max_baseline;
-        self.frontier = grown.frontier.map_or(Frontier::Unknown, Frontier::Narrow);
+        self.frontier = if offset + grown.max_wavefront > other_seq.len() {
+            Frontier::Unknown
+        } else {
+            Frontier::from_bounds(grown.frontier_start, grown.frontier_end)
+        };
         self.extended_len = other_seq.len();
         Ok(())
     }
@@ -471,7 +453,7 @@ impl DWFALite {
         self.max_wavefront += steps;
         self.max_baseline += steps;
         self.extended_len = other_len;
-        // this only runs for wavefronts that are too wide for the frontier bitmask
+        // Closed-form edits do not record which diagonals are still exactly at the end.
         self.frontier = Frontier::Unknown;
     }
 
@@ -506,7 +488,7 @@ impl DWFALite {
             // Once every diagonal is at or past the end of `other_seq`, no diagonal can extend again, and the remaining
             // edits have a closed form. Values only grow, so this stays true. The scan usually stops at once, on a low
             // diagonal that has not reached the end. In the worst case, it adds one pass per edit to the growth pass.
-            if self.wavefront.len() > FRONTIER_BITS && self.wavefront.iter().all(|&d| d + self.offset >= other_seq.len()) {
+            if self.wavefront.len() > NARROW_GROWTH_LIMIT && self.wavefront.iter().all(|&d| d + self.offset >= other_seq.len()) {
                 self.finish_without_matches(baseline_seq.len(), other_seq.len());
             } else {
                 // The selected endpoint still needs another edit.
@@ -611,15 +593,10 @@ impl DWFALite {
             return;
         }
         match self.frontier {
-            // the bitmask holds exactly the diagonals with `d + offset == other_seq.len()`, in wavefront order
-            Frontier::Narrow(mut bits) if other_seq.len() == self.extended_len => {
-                while bits != 0 {
-                    let i = bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    let offset = self.wavefront[i] + self.edit_distance - i;
-                    if offset < baseline_seq.len() {
-                        symbols.push(baseline_seq[offset]);
-                    }
+            Frontier::Single(i) if other_seq.len() == self.extended_len => {
+                let offset = self.wavefront[i] + self.edit_distance - i;
+                if offset < baseline_seq.len() {
+                    symbols.push(baseline_seq[offset]);
                 }
             },
             // the bounds enclose the equality lanes; holes inside the range are skipped
@@ -662,24 +639,9 @@ impl DWFALite {
             return;
         }
         // try to short-circuit the extension symbols computation
-        if let Frontier::Narrow(bits) = self.frontier {
-            let low_bits = bits as u64;
-            if other_seq.len() == self.extended_len && (bits >> 64) == 0 && low_bits & low_bits.wrapping_sub(1) == 0 {
-                // zero or one diagonal at the frontier, in the low 64 bits
-                if low_bits != 0 {
-                    let i = low_bits.trailing_zeros() as usize;
-                    let offset = self.wavefront[i] + self.edit_distance - i;
-                    if offset < baseline_seq.len() {
-                        votes.add_single(baseline_seq[offset], weight);
-                    }
-                }
-                return;
-            }
-        }
-        if let Frontier::Wide { start, end } = self.frontier {
-            if other_seq.len() == self.extended_len && start + 1 == end {
-                // One lane. A one-lane range has no hole, so `start` is that diagonal.
-                let offset = self.wavefront[start] + self.edit_distance - start;
+        if let Frontier::Single(i) = self.frontier {
+            if other_seq.len() == self.extended_len {
+                let offset = self.wavefront[i] + self.edit_distance - i;
                 if offset < baseline_seq.len() {
                     votes.add_single(baseline_seq[offset], weight);
                 }
@@ -715,7 +677,7 @@ impl DWFALite {
 mod tests {
     use super::*;
     use super::super::dwfa_config::DWFALiteConfigBuilder;
-    use super::super::wavefront::FRONTIER_BITS;
+    use super::super::wavefront::NARROW_GROWTH_LIMIT;
 
     /// Checks that finishing many edits at once gives the same result as adding one edit at a time
     #[test]
@@ -751,9 +713,9 @@ mod tests {
                         let mut expected = actual.clone();
                         let mut reaches_bulk_guard = false;
                         while expected.edit_distance() < distance && !expected.edit_distance_at_limit() {
-                            // Bulk growth is possible once the wavefront is too wide for the bitmask
+                            // Bulk growth is possible once the wavefront is past `NARROW_GROWTH_LIMIT`
                             // and every diagonal has reached the end of the other sequence
-                            reaches_bulk_guard |= expected.wavefront().len() > FRONTIER_BITS
+                            reaches_bulk_guard |= expected.wavefront().len() > NARROW_GROWTH_LIMIT
                                 && expected.wavefront().iter().all(|&d| d + offset >= other.len());
                             expected.increase_edit_distance(&baseline, &other).unwrap();
                         }
@@ -814,7 +776,7 @@ mod tests {
             let wildcard = if trial % 3 == 0 { Some(b'*') } else { None };
             let alphabet: &[u8] = if wildcard.is_some() { b"ACGT*" } else { b"ACGT" };
             let baseline: Vec<u8> = (0..rng.gen_range(0..200)).map(|_| alphabet[rng.gen_range(0..alphabet.len())]).collect();
-            // related pairs keep the distance small; unrelated pairs push it past the frontier bitmask width
+            // related pairs keep the distance small; unrelated pairs push it past `NARROW_GROWTH_LIMIT`
             let mut other: Vec<u8> = if trial % 2 == 0 {
                 baseline.iter().filter(|_| rng.gen_range(0..10) != 0).cloned().collect()
             } else {
@@ -844,8 +806,8 @@ mod tests {
             assert_eq!(dwfa.edit_distance(), table[baseline.len()][other.len() - offset], "trial {trial}, finalized");
             max_seen = max_seen.max(dwfa.edit_distance());
         }
-        // make sure the wide-wavefront fallback was exercised
-        assert!(2 * max_seen + 1 > FRONTIER_BITS);
+        // make sure the wide-wavefront growth was exercised
+        assert!(2 * max_seen + 1 > NARROW_GROWTH_LIMIT);
     }
 
     /// The wavefront algorithm before the frontier and growth changes: grow by scattering into a zeroed wavefront,
@@ -930,7 +892,7 @@ mod tests {
             max_seen = max_seen.max(dwfa.edit_distance());
         }
         // make sure that both the narrow and the wide growth were exercised
-        assert!(2 * max_seen + 1 > 4 * FRONTIER_BITS);
+        assert!(2 * max_seen + 1 > 4 * NARROW_GROWTH_LIMIT);
     }
 
     #[test]
@@ -1001,6 +963,64 @@ mod tests {
         dwfa.vote(baseline, other, 0.5, &mut votes, &mut scratch);
         votes.candidates(None, &mut candidates);
         assert_eq!(HashMap::from_iter(candidates.iter().copied()), expected);
+    }
+
+    fn assert_frontier_invariant(dwfa: &DWFALite, other: &[u8]) {
+        let equality_lanes: Vec<usize> = dwfa.wavefront.iter().enumerate()
+            .filter_map(|(i, &d)| (d + dwfa.offset == other.len()).then_some(i))
+            .collect();
+        match dwfa.frontier {
+            Frontier::Single(i) => assert_eq!(equality_lanes, vec![i]),
+            Frontier::Wide { start, end } => match equality_lanes.as_slice() {
+                [] => assert_eq!((start, end), (0, 0)),
+                [i] => panic!("single equality lane {i} should use Frontier::Single"),
+                lanes => assert_eq!((start, end), (*lanes.first().unwrap(), lanes.last().unwrap() + 1)),
+            },
+            Frontier::Unknown => {},
+        }
+    }
+
+    fn vote_candidates(dwfa: &DWFALite, baseline: &[u8], other: &[u8]) -> Vec<(u8, f64)> {
+        let mut votes = ExtensionVotes::default();
+        let mut scratch = VoteScratch::default();
+        let mut candidates = Vec::new();
+        dwfa.vote(baseline, other, 1.0, &mut votes, &mut scratch);
+        votes.candidates(None, &mut candidates);
+        candidates
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_single_frontier_matches_full_scan() {
+        let baseline = b"ACGT";
+        let mut actual = DWFALite::default();
+        actual.update(baseline, b"A").unwrap();
+        assert_frontier_invariant(&actual, b"A");
+        assert!(matches!(actual.frontier, Frontier::Single(0)));
+
+        let mut expected = actual.clone();
+        expected.frontier = Frontier::Unknown;
+        let (_, next_symbol) = actual.update(baseline, b"AC").unwrap();
+        expected.update(baseline, b"AC").unwrap();
+        assert_eq!(next_symbol, Some(b'G'));
+        assert_eq!(actual.edit_distance, expected.edit_distance);
+        assert_eq!(actual.wavefront, expected.wavefront);
+        assert_eq!(actual.max_wavefront, expected.max_wavefront);
+        assert_eq!(actual.max_baseline, expected.max_baseline);
+        assert_eq!(actual.frontier, expected.frontier);
+        assert_eq!(actual.get_extension_candidates(baseline, b"AC"), expected.get_extension_candidates(baseline, b"AC"));
+        assert_eq!(vote_candidates(&actual, baseline, b"AC"), vote_candidates(&expected, baseline, b"AC"));
+        assert_frontier_invariant(&actual, b"AC");
+
+        let mut empty = DWFALite::default();
+        empty.extend(b"A", b"T");
+        assert!(matches!(empty.frontier, Frontier::Wide { start: 0, end: 0 }));
+        assert_frontier_invariant(&empty, b"T");
+
+        let mut wide = DWFALite::default();
+        wide.update(b"AC", b"C").unwrap();
+        assert!(matches!(wide.frontier, Frontier::Wide { .. }));
+        assert_frontier_invariant(&wide, b"C");
     }
 
     fn dwfa_config(wildcard: Option<u8>, allow_early_termination: bool, max_edit_distance: Option<usize>) -> DWFALiteConfig {

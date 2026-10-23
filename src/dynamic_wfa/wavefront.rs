@@ -1,27 +1,36 @@
 use std::collections::VecDeque;
 
-/// The widest wavefront that the `frontier` bitmask can track.
-pub(super) const FRONTIER_BITS: usize = u128::BITS as usize;
-
 /// Cached extrema after one growth.
 /// `max_wavefront` is the farthest position reached after `offset`; add `offset` for the index in `other_seq`.
 /// `max_baseline` is the farthest consumed position in `baseline_seq`.
-/// `frontier` is `Some` after a narrow growth, including `Some(0)` when no diagonal is at the end.
-/// Wide growth leaves it `None` because the bitmask was not computed.
+/// `frontier_start..frontier_end` is the smallest half-open range of diagonals at the end of `other_seq`.
+/// `frontier_start == frontier_end == 0` means there are none. Diagonals past that end are left out.
 pub(super) struct GrownWavefront {
     /// Farthest position reached after `offset`. The index in `other_seq` is `offset + max_wavefront`.
     pub(super) max_wavefront: usize,
     /// Farthest consumed position in `baseline_seq`.
     pub(super) max_baseline: usize,
-    /// Bit `i` is set when diagonal `i` is at the end of `other_seq`.
-    /// `None` means the bitmask was not computed. `Some(0)` means it was computed and no diagonal is at the end.
-    pub(super) frontier: Option<u128>,
+    /// First diagonal at the end of `other_seq`, or `0` when there are none.
+    pub(super) frontier_start: usize,
+    /// One past the last diagonal at the end of `other_seq`, or `0` when there are none.
+    pub(super) frontier_end: usize,
 }
 
 impl GrownWavefront {
-    /// A growth that does not compute the frontier bitmask.
+    /// A growth that has not yet found a diagonal at the end of `other_seq`.
     pub(super) fn new() -> GrownWavefront {
-        GrownWavefront { max_wavefront: 0, max_baseline: 0, frontier: None }
+        GrownWavefront { max_wavefront: 0, max_baseline: 0, frontier_start: 0, frontier_end: 0 }
+    }
+
+    /// Includes diagonal `i` in the frontier bounds.
+    fn record_frontier_diagonal(&mut self, i: usize) {
+        if self.frontier_end == 0 {
+            self.frontier_start = i;
+            self.frontier_end = i + 1;
+        } else {
+            self.frontier_start = self.frontier_start.min(i);
+            self.frontier_end = self.frontier_end.max(i + 1);
+        }
     }
 }
 
@@ -33,7 +42,7 @@ impl GrownWavefront {
 // * insertion of a base into `baseline_seq` from diagonal `i - 2`; this progresses `other_seq`
 // Diagonal 0 has only a deletion, diagonal 1 has no insertion, and the two new diagonals at the end have no deletion.
 
-/// Grows a wavefront that fits the frontier bitmask, in place, and fills `GrownWavefront::frontier`.
+/// Grows a wavefront in place and records which diagonals are at the end of `other_seq`.
 /// It is filled from the end, so that `wavefront[i - 2..=i]` still holds the old values when diagonal `i` is computed.
 /// The `Vec` grows with amortized doubling, and a clone has spare capacity, so most calls do not allocate.
 /// # Arguments
@@ -41,9 +50,8 @@ impl GrownWavefront {
 /// * `grower` - the sequences and edit distance for the new diagonals
 #[inline(always)]
 pub(super) fn grow_wavefront(wavefront: &mut Vec<usize>, mut grower: WavefrontGrower<'_>) -> GrownWavefront {
-    // `old_len + 2 <= FRONTIER_BITS` ensures every grown diagonal has a frontier bit.
     let old_len = wavefront.len();
-    debug_assert!(old_len > 0 && old_len + 2 <= FRONTIER_BITS);
+    debug_assert!(old_len > 0);
     
     // Resize the wavefront to the new length.
     wavefront.resize(old_len + 2, 0);
@@ -75,57 +83,6 @@ pub(super) fn grow_wavefront(wavefront: &mut Vec<usize>, mut grower: WavefrontGr
     // visit first diagonal.
     wavefront[0] = grower.visit(0, wavefront[0]);
     grower.grown
-}
-
-/// Grows a wide wavefront (without the frontier bitmask) in two passes over a new allocation. The result is the
-/// same as `grow_wavefront()`. Wide wavefronts come from large edit distances, e.g., in `finalize()`, where most
-/// diagonals are past the end of a sequence and can never extend again. A separate pass lets the gather use vector
-/// instructions, and the extension pass skips those diagonals with a well-predicted branch.
-/// # Arguments
-/// * `wavefront` - the wavefront to replace with the grown one
-/// * `baseline_seq` - the baseline sequence, theoretically fixed
-/// * `other_seq` - the other sequence, typically getting updates
-/// * `edit_distance` - the edit distance of the grown wavefront
-/// * `offset` - the offset into `other_seq` where the baseline starts
-/// * `wildcard` - an optional wildcard symbol
-pub(super) fn grow_wide_wavefront(
-    wavefront: &mut Vec<usize>, baseline_seq: &[u8], other_seq: &[u8], edit_distance: usize, offset: usize, wildcard: Option<u8>
-) -> GrownWavefront {
-    let old = &wavefront[..];
-    let old_len = old.len();
-    debug_assert!(old_len >= 2);
-    let mut new_wavefront: Vec<usize> = Vec::with_capacity(old_len + 2);
-
-    // These produce diagonals 0, 1, 2..old_len-1, old_len, and old_len+1 respectively.
-    // gather, see `grow_wavefront()` for the three moves
-    // first two diagonals can only come from the first two old diagonals
-    new_wavefront.push(old[0]);
-    new_wavefront.push(old[1].max(old[0] + 1));
-
-    // standard 3 possible sources for each diagonal
-    new_wavefront.extend(old.windows(3).map(|w| w[2].max(w[1] + 1).max(w[0] + 1)));
-
-    // last two diagonals can only come from the last two old diagonals
-    new_wavefront.push((old[old_len - 1] + 1).max(old[old_len - 2] + 1));
-    new_wavefront.push(old[old_len - 1] + 1);
-
-    // extend and get the maxima; `match_length()` is 0 for a diagonal at or past the end of either sequence
-    let (baseline_len, other_len) = (baseline_seq.len(), other_seq.len());
-    let mut grown = GrownWavefront::new();
-    for (i, d) in new_wavefront.iter_mut().enumerate() {
-        // extend the diagonal where possible
-        if *d + offset < other_len && *d + edit_distance - i < baseline_len {
-            *d += match_length(baseline_seq, other_seq, *d + edit_distance - i, *d + offset, wildcard);
-        }
-
-        // update the GrownWavefront statistics based on the maximal extension
-        grown.max_wavefront = grown.max_wavefront.max(*d);
-        grown.max_baseline = grown.max_baseline.max(*d + edit_distance - i);
-    }
-
-    // replace the old wavefront, return the GrownWavefront statistics
-    *wavefront = new_wavefront;
-    grown
 }
 
 /// Conceptually, this function plays out the wavefront edit distance extension.
@@ -188,7 +145,7 @@ pub(super) fn grow_without_matches(wavefront: &mut Vec<usize>, edit_distance: us
     }
 }
 
-/// The inputs that each diagonal needs while a narrow wavefront grows. A method, unlike a closure, can be forced inline.
+/// The inputs that each diagonal needs while a wavefront grows. A method, unlike a closure, can be forced inline.
 pub(super) struct WavefrontGrower<'a> {
     baseline_seq: &'a [u8],
     other_seq: &'a [u8],
@@ -214,8 +171,7 @@ impl<'a> WavefrontGrower<'a> {
             edit_distance,
             offset,
             wildcard,
-            // `Some(0)` means the bitmask is being computed and no diagonal is at the end yet.
-            grown: GrownWavefront { frontier: Some(0), ..GrownWavefront::new() },
+            grown: GrownWavefront::new(),
         }
     }
 
@@ -227,8 +183,7 @@ impl<'a> WavefrontGrower<'a> {
     fn visit(&mut self, i: usize, d: usize) -> usize {
         let d = d + match_length(self.baseline_seq, self.other_seq, d + self.edit_distance - i, d + self.offset, self.wildcard);
         if d + self.offset == self.other_seq.len() {
-            // Narrow growth starts the frontier at `Some(0)`.
-            *self.grown.frontier.as_mut().unwrap() |= 1 << i;
+            self.grown.record_frontier_diagonal(i);
         }
         self.grown.max_wavefront = self.grown.max_wavefront.max(d);
         self.grown.max_baseline = self.grown.max_baseline.max(d + self.edit_distance - i);

@@ -29,9 +29,8 @@ jobs:
         run: |
           git fetch --no-tags origin "${{ github.base_ref }}"
           git checkout --detach "origin/${{ github.base_ref }}"
-          # The bench groups already take 10 samples. A 0.5s warm-up and 2s of
-          # measurement sit between --quick (two samples) and the 3s + 5s default.
-          cargo bench --bench consensus_bench -- --save-baseline upstream --warm-up-time 0.5 --measurement-time 2 --noplot --color never
+          # 0.2s warm-up and 0.5s of measurement. Sample size is Criterion's default.
+          cargo bench --bench consensus_bench -- --save-baseline upstream --warm-up-time 0.2 --measurement-time 0.5 --noplot --color never
 
       - name: Bench pull request
         run: |
@@ -42,7 +41,7 @@ jobs:
           if [ -d target/criterion ]; then
             find target/criterion -type d -name new -print0 | xargs -0 -r rm -rf
           fi
-          cargo bench --bench consensus_bench -- --baseline-lenient upstream --warm-up-time 0.5 --measurement-time 2 --noplot --color never 2>&1 | tee /tmp/bench-compare.txt
+          cargo bench --bench consensus_bench -- --baseline-lenient upstream --warm-up-time 0.2 --measurement-time 0.5 --noplot --color never 2>&1 | tee /tmp/bench-compare.txt
 
       - name: Render comparison table
         if: always()

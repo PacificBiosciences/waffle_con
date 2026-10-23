@@ -14,7 +14,6 @@ pub fn bench_consensus(c: &mut Criterion) {
     let error_rates = [0.0, 0.01];
 
     let mut benchmark_group = c.benchmark_group("consensus-group");
-    benchmark_group.sample_size(10);
 
     for &sl in seq_lens.iter() {
         for &ns in num_samples.iter() {
@@ -79,7 +78,6 @@ pub fn bench_dual_consensus(c: &mut Criterion) {
     let error_rates = [0.0, 0.01];
 
     let mut benchmark_group = c.benchmark_group("dual-consensus-group");
-    benchmark_group.sample_size(10);
 
     for &sl in seq_lens.iter() {
         // About 2% of positions differ between the two true alleles, and at least one.
@@ -116,7 +114,6 @@ pub fn bench_finalize(c: &mut Criterion) {
     let gap_lens = [1000, 2000, 3000];
 
     let mut benchmark_group = c.benchmark_group("finalize-group");
-    benchmark_group.sample_size(10);
 
     for &sl in seq_lens.iter() {
         for &gap in gap_lens.iter() {

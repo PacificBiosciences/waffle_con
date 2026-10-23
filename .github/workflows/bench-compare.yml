@@ -16,6 +16,11 @@ jobs:
   bench:
     name: cargo bench
     runs-on: ubuntu-latest
+    env:
+      # Printed in the comparison comment. Criterion requires at least 10 samples.
+      BENCH_SAMPLE_SIZE: 30
+      BENCH_WARMUP: 0.2
+      BENCH_MEASUREMENT: 0.5
     steps:
       - uses: actions/checkout@v4
         with:
@@ -29,8 +34,7 @@ jobs:
         run: |
           git fetch --no-tags origin "${{ github.base_ref }}"
           git checkout --detach "origin/${{ github.base_ref }}"
-          # 0.2s warm-up and 0.5s of measurement. Sample size is Criterion's default.
-          cargo bench --bench consensus_bench -- --save-baseline upstream --warm-up-time 0.2 --measurement-time 0.5 --noplot --color never
+          cargo bench --bench consensus_bench -- --save-baseline upstream --sample-size "$BENCH_SAMPLE_SIZE" --warm-up-time "$BENCH_WARMUP" --measurement-time "$BENCH_MEASUREMENT" --noplot --color never
 
       - name: Bench pull request
         run: |
@@ -41,7 +45,7 @@ jobs:
           if [ -d target/criterion ]; then
             find target/criterion -type d -name new -print0 | xargs -0 -r rm -rf
           fi
-          cargo bench --bench consensus_bench -- --baseline-lenient upstream --warm-up-time 0.2 --measurement-time 0.5 --noplot --color never 2>&1 | tee /tmp/bench-compare.txt
+          cargo bench --bench consensus_bench -- --baseline-lenient upstream --sample-size "$BENCH_SAMPLE_SIZE" --warm-up-time "$BENCH_WARMUP" --measurement-time "$BENCH_MEASUREMENT" --noplot --color never 2>&1 | tee /tmp/bench-compare.txt
 
       - name: Render comparison table
         if: always()
@@ -183,8 +187,12 @@ jobs:
           } else {
             const paired = rows.filter((row) => row.upstream && row.new);
             const body = [...rows.map(formatRow), ...(paired.length ? [formatRow(combinedRow(paired))] : [])].join('\n');
+            const parameters = `Sample size ${process.env.BENCH_SAMPLE_SIZE}, warm-up ${process.env.BENCH_WARMUP} s, measurement ${process.env.BENCH_MEASUREMENT} s.`;
             markdown = [
               `## Criterion Benchmark (consensus_bench) for ${shortSha}`,
+              '',
+              parameters,
+              '',
               '  <details>',
               '    <summary>Click to view benchmark</summary>',
               '',

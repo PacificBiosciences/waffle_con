@@ -60,7 +60,7 @@ fn build_cases() -> Vec<Case> {
     let mut cases = vec![];
     // Consensus and dual consensus share the length, sample-count, and error-rate grid.
     for dual in [false, true] {
-        for sl in [50, 200, 1000] {
+        for sl in [100, 1000, 10000] {
             // About 2% of positions differ between the two true alleles, and at least one.
             // Consensus cases ignore this value.
             let num_differences = (sl / 50).max(1);
@@ -85,15 +85,6 @@ fn build_cases() -> Vec<Case> {
             }
         }
     }
-
-    // One longer consensus test case
-    let (sl, ns, er) = (10000, 30, 0.01);
-    let min_count = (ns as u64) / 4;
-    let (_consensus, dataset) = generate_test(alphabet_size, sl, ns, er);
-    cases.push(Case {
-        label: format!("consensus_{alphabet_size}x{sl}x{ns}_{er}"),
-        input: Input::Consensus { min_count, dataset },
-    });
 
     // 4000 leaves 500 bases on either side of the largest gap.
     let (sl, er) = (4000, 0.01);

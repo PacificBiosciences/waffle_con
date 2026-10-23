@@ -9,7 +9,7 @@ use waffle_con::example_gen::{generate_dual_test, generate_finalize_pair, genera
 
 pub fn bench_consensus(c: &mut Criterion) {
     let alphabet_size = 4;
-    let seq_lens = [50, 200, 1000];
+    let seq_lens = [100, 1000, 10000];
     let num_samples = [10, 30];
     let error_rates = [0.0, 0.01];
 
@@ -49,31 +49,12 @@ pub fn bench_consensus(c: &mut Criterion) {
         }
     }
 
-    // One longer consensus, so the cost of a separate update and vote pass is visible.
-    let sl = 10000;
-    let ns = 30;
-    let er = 0.01;
-    let config = CdwfaConfigBuilder::default()
-        .min_count((ns as u64) / 4)
-        .build().unwrap();
-    let (_consensus, dataset) = generate_test(alphabet_size, sl, ns, er);
-    let test_label = format!("consensus_{alphabet_size}x{sl}x{ns}_{er}");
-    benchmark_group.bench_function(&test_label, |b| b.iter(|| {
-        black_box({
-            let mut consensus_dwfa = ConsensusDWFA::with_config(config.clone()).unwrap();
-            for s in dataset.iter() {
-                consensus_dwfa.add_sequence(s).unwrap();
-            }
-            consensus_dwfa.consensus().unwrap()
-        });
-    }));
-
     benchmark_group.finish();
 }
 
 pub fn bench_dual_consensus(c: &mut Criterion) {
     let alphabet_size = 4;
-    let seq_lens = [50, 200, 1000];
+    let seq_lens = [100, 1000, 10000];
     let num_samples = [10, 30];
     let error_rates = [0.0, 0.01];
 

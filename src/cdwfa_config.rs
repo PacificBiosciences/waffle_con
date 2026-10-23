@@ -1,7 +1,7 @@
 
 /*!
 Contains configuration information for the consensus DWFA algorithm.
-Typical usage is to the use the builder to construct the config, e.g.
+Typical usage is to use the builder to construct the config, e.g.
 ```
 use waffle_con::cdwfa_config::{CdwfaConfig, CdwfaConfigBuilder, ConsensusCost};
 let config: CdwfaConfig = CdwfaConfigBuilder::default()
@@ -29,7 +29,7 @@ pub enum ConsensusCost {
 
 /**
 Contains configuration information for the consensus DWFA algorithm.
-Typical usage is to the use the builder to construct the config, e.g.
+Typical usage is to use the builder to construct the config, e.g.
 ```
 use waffle_con::cdwfa_config::{CdwfaConfig, CdwfaConfigBuilder, ConsensusCost};
 let config: CdwfaConfig = CdwfaConfigBuilder::default()
@@ -62,7 +62,7 @@ pub struct CdwfaConfig {
     pub wildcard: Option<u8>,
     /// Dual mode DWFA edit distance pruning threshold; if the DWFAs for the two options diverge more than this threshold, the worse one stops getting tracked
     pub dual_max_ed_delta: usize,
-    // if true, then this will not penalize input sequences that are shorter than the final consensus
+    /// If true, an input sequence shorter than the consensus is not penalized for the unused suffix.
     pub allow_early_termination: bool,
     /// if true, this will automatically shift offsets downwards if nothing starts at "0"
     pub auto_shift_offsets: bool,

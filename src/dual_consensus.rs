@@ -56,8 +56,6 @@ use crate::node_pool::NodePool;
 use crate::pqueue_tracker::PQueueTracker;
 use crate::priority_queue::{CachePriority, PriorityQueue};
 
-/// We have a max-hap, so (Reverse(edit distance), length).
-/// This mean lowest edit distance first, tie-break with the longest consensus length.
 /// Lower cost, then longer consensus, then an earlier tie-breaker.
 type NodePriority = (Reverse<usize>, usize, Reverse<u64>);
 
@@ -145,7 +143,7 @@ impl DualConsensus {
     /// Of note, this will re-order dual alleles alpha-numerically, allowing for predictable outputs.
     /// # Arguments
     /// * `finalized_node` - the node that we are converting to a consensus
-    /// * `consensus_cost` - the cost model that gets propated
+    /// * `consensus_cost` - the cost model that gets propagated
     fn from_node(finalized_node: &DualConsensusNode, consensus_cost: ConsensusCost) -> Result<DualConsensus, SimpleError> {
         // check if we need to swap the order
         let swap_order = finalized_node.is_dual && (finalized_node.consensus2 < finalized_node.consensus1);

@@ -10,14 +10,14 @@ This crate contains functionality for:
 
 * ConsensusDWFA - One input string per sequence, one output sequence
 * DualConsensusDWFA - One input string per sequence, 1 or 2 output sequences
-* PriorityConsensuDWFA - Multiple input strings per sequence (priority), 1+ output sequences
+* PriorityConsensusDWFA - Multiple input strings per sequence (priority), 1+ output sequences
 
 ## Full documentation
 `waffle_con` provides extensive in-line documentation.
 A user-friendly HTML version can be generated via `cargo doc`.
 
 ## Methods
-At a high level, this project provided many consensus algorithms that slowly build upon each other from a baseline single-consensus method.
+At a high level, this project provides several consensus algorithms that build upon each other from a baseline single-consensus method.
 The single consensus method is based on the idea of cost-based exploration of an assembly (or consensus) space.
 "Cost" in this context is basically the edit distance between the assembled sequence and a set of inputs.
 We use a dynamic WFA algorithm to both nominate and score the assembled sequences.
@@ -39,7 +39,8 @@ Finally, priority consensus is just multi-consensus on a chain of sequence input
 `waffle_con` has been designed for the specific purpose of PGx consensus in StarPhase using long, accurate HiFi reads.
 The underlying algorithms rely on a basic edit-distance wavefront algorithm, which scales with the total edit distance between two sequences.
 Thus, high error or high divergence sequences are more likely to lead to longer run times.
-Additionally, high error may cause the traversal algorithm to "get lost" in the search space due to weak consensus, which may ultimatley lead to lower quality consensus sequences.
+Optional edit-distance caps stop a read from contributing once it passes a hard maximum, a fraction of its length, or both, with an optional floor on that limit.
+Additionally, high error may cause the traversal algorithm to "get lost" in the search space due to weak consensus, which may ultimately lead to lower quality consensus sequences.
 Additionally, best results are with full-length input sequences.
 Partial sequences require estimating start/stop positions, which injects more opportunities for error.
 

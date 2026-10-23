@@ -1,8 +1,8 @@
-# Unreleased
+# v0.5.0
 ## Features
 * Added optional edit-distance caps to the config so a read stops contributing once it diverges too far: a hard maximum, a fraction of the read length, and a floor on the resolved cap. By default, none of these are set, matching previous behavior. Set them to improve performance when highly divergent reads are part of the input set.
 * Single consensus results report which reads were halted at that cap. `Consensus::assignments()` is `None` when every read was included.
-* Dual consensus results report which allele each read belongs to. A read can tie, or hit the cap on both alleles.
+* Dual consensus results report which allele each read belongs to. A read can tie, or be unassigned when every allele still tracked for it is past the cap.
 * Numerous performance enhancements were incorporated. All consensus modes should run faster.
 
 ## Bugs
@@ -12,9 +12,9 @@
 * `Consensus::new` now takes per-read assignments and returns a `Result`
 * `DualConsensus::new` takes `Vec<SequenceAssignment>` instead of `Vec<bool>`, and `is_consensus1()` is replaced by `assignments()`
 * `DWFALite::new` takes a `DWFALiteConfig` instead of a wildcard and an early-termination flag
-* `DWFALite::update` returns `(edit_distance, Option<u8>)` instead of the edit distance alone. The optional symbol is the next baseline symbol when one frontier diagonal advanced.
+* `DWFALite::update` returns `(edit_distance, Option<u8>)` instead of the edit distance alone. The symbol is the next baseline base when a single frontier diagonal advanced and another base remains.
 * `DWFALite::get_extension_candidates` is no longer public
-* The order of tie-breaking has changed, which may lead to slightly different results when there is not a dominant symbol
+* Tie-breaking order has changed. Equal extension votes follow the order each symbol is first seen, and equal-cost search nodes keep the earlier one, so results can differ when no symbol dominates.
 
 # v0.4.4
 ## Bugs

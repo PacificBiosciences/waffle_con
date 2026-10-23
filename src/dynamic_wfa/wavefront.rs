@@ -3,8 +3,8 @@ use std::collections::VecDeque;
 /// Cached extrema after one growth.
 /// `max_wavefront` is the farthest position reached after `offset`; add `offset` for the index in `other_seq`.
 /// `max_baseline` is the farthest consumed position in `baseline_seq`.
-/// `frontier_start..frontier_end` is the smallest half-open range containing equality lanes.
-/// `frontier_start == frontier_end == 0` means none. Lanes past the end are not included.
+/// `frontier_start..frontier_end` is the smallest half-open range of diagonals at the end of `other_seq`.
+/// `frontier_start == frontier_end == 0` means there are none. Diagonals past that end are left out.
 pub(super) struct GrownWavefront {
     /// Farthest position reached after `offset`. The index in `other_seq` is `offset + max_wavefront`.
     pub(super) max_wavefront: usize,
@@ -17,13 +17,13 @@ pub(super) struct GrownWavefront {
 }
 
 impl GrownWavefront {
-    /// A growth that has not seen an equality lane yet.
+    /// A growth that has not yet found a diagonal at the end of `other_seq`.
     pub(super) fn new() -> GrownWavefront {
         GrownWavefront { max_wavefront: 0, max_baseline: 0, frontier_start: 0, frontier_end: 0 }
     }
 
-    /// Includes diagonal `i` in the equality-lane bounds.
-    fn record_equality_lane(&mut self, i: usize) {
+    /// Includes diagonal `i` in the frontier bounds.
+    fn record_frontier_diagonal(&mut self, i: usize) {
         if self.frontier_end == 0 {
             self.frontier_start = i;
             self.frontier_end = i + 1;
@@ -42,7 +42,7 @@ impl GrownWavefront {
 // * insertion of a base into `baseline_seq` from diagonal `i - 2`; this progresses `other_seq`
 // Diagonal 0 has only a deletion, diagonal 1 has no insertion, and the two new diagonals at the end have no deletion.
 
-/// Grows a wavefront in place and records equality-lane bounds.
+/// Grows a wavefront in place and records which diagonals are at the end of `other_seq`.
 /// It is filled from the end, so that `wavefront[i - 2..=i]` still holds the old values when diagonal `i` is computed.
 /// The `Vec` grows with amortized doubling, and a clone has spare capacity, so most calls do not allocate.
 /// # Arguments
@@ -145,7 +145,7 @@ pub(super) fn grow_without_matches(wavefront: &mut Vec<usize>, edit_distance: us
     }
 }
 
-/// The inputs that each diagonal needs while a narrow wavefront grows. A method, unlike a closure, can be forced inline.
+/// The inputs that each diagonal needs while a wavefront grows. A method, unlike a closure, can be forced inline.
 pub(super) struct WavefrontGrower<'a> {
     baseline_seq: &'a [u8],
     other_seq: &'a [u8],
@@ -183,7 +183,7 @@ impl<'a> WavefrontGrower<'a> {
     fn visit(&mut self, i: usize, d: usize) -> usize {
         let d = d + match_length(self.baseline_seq, self.other_seq, d + self.edit_distance - i, d + self.offset, self.wildcard);
         if d + self.offset == self.other_seq.len() {
-            self.grown.record_equality_lane(i);
+            self.grown.record_frontier_diagonal(i);
         }
         self.grown.max_wavefront = self.grown.max_wavefront.max(d);
         self.grown.max_baseline = self.grown.max_baseline.max(d + self.edit_distance - i);

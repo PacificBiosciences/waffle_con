@@ -55,7 +55,7 @@ pub struct DWFALite {
     /// A diagonal that stopped before this position stopped on a mismatch or the baseline end.
     /// Because `other_seq` only grows, only diagonals at this frontier can extend again.
     extended_len: usize,
-    /// Equality lanes at `extended_len`: one exact lane or enclosing wide bounds.
+    /// Diagonals at `extended_len`: one exact diagonal, or bounds around all of them.
     /// Unknown metadata requires a full scan; it never limits the observable wavefront.
     frontier: Frontier,
 }
@@ -65,15 +65,15 @@ pub struct DWFALite {
 enum Frontier {
     /// The bounds were not computed. The next extension visits every diagonal.
     Unknown,
-    /// The only equality lane at `extended_len`.
+    /// The only diagonal at `extended_len`.
     Single(usize),
-    /// Smallest half-open range containing every equality lane; holes are filtered on use.
+    /// Smallest half-open range containing every diagonal at `extended_len`; holes are filtered on use.
     /// An empty frontier is represented by `start == end == 0`.
     Wide { start: usize, end: usize },
 }
 
 impl Frontier {
-    /// Makes the most precise representation for equality lanes enclosed by `[start, end)`.
+    /// Makes the most precise representation for frontier diagonals enclosed by `[start, end)`.
     #[inline]
     fn from_bounds(start: usize, end: usize) -> Self {
         if end == start + 1 {
@@ -191,7 +191,7 @@ impl DWFALite {
     /// Returns `None` when this path does not apply and nothing was changed.
     /// Returns `Some` when the diagonal advanced. 
     /// The inner value is the next baseline symbol on that diagonal if it exists, or `None` when the baseline has no further symbol (at end).
-    /// A `Single` frontier directly names the lane; wide singleton bounds support any lane.
+    /// A `Single` frontier names that diagonal. A `Wide` range of one diagonal is the same case.
     /// # Arguments
     /// * `baseline_seq` - the baseline sequence, theoretically fixed
     /// * `other_seq` - the other sequence, typically getting updates
@@ -211,7 +211,7 @@ impl DWFALite {
             },
             Frontier::Wide { start, end } => {
                 // Fall back unless the bounds name one diagonal, one byte was appended,
-                // and that diagonal holds the cached maximum. A one-lane range has no hole.
+                // and that diagonal holds the cached maximum. A one-diagonal range has no hole.
                 if self.state != DWFALiteState::Active || end != start + 1 ||
                     other_seq.len() != self.extended_len + 1 || self.offset + self.max_wavefront != self.extended_len {
                     return None;
@@ -318,7 +318,7 @@ impl DWFALite {
                 };
             },
             Frontier::Wide { start, end } if other_len >= self.extended_len => {
-                // Only lanes at the previous frontier can move. Holes inside the bounds are skipped.
+                // Only diagonals at the previous frontier can move. Holes inside the bounds are skipped.
                 // If none reach the new end, `start == end == 0` is the empty wide frontier.
                 // The new range may still contain holes.
                 let mut next_start = 0;
@@ -371,7 +371,7 @@ impl DWFALite {
                 self.max_wavefront = max_wavefront;
                 self.max_baseline = max_baseline;
                 self.frontier = if offset + max_wavefront > other_len {
-                    // A lane past the end can extend when `other_seq` catches up, so equality bounds would omit it.
+                    // A diagonal past the end can extend when `other_seq` catches up, so these bounds would omit it.
                     Frontier::Unknown
                 } else {
                     Frontier::from_bounds(next_start, next_end)
@@ -402,7 +402,7 @@ impl DWFALite {
         // first, increase the distance we're at
         self.edit_distance += 1;
 
-        // Grow and re-extend in place. A lane past the end of `other_seq` cannot be named by equality bounds.
+        // Grow and re-extend in place. A diagonal past the end of `other_seq` cannot be named by these bounds.
         let (edit_distance, offset, wildcard) = (self.edit_distance, self.offset, self.config.wildcard);
         let grown = grow_wavefront(
             &mut self.wavefront,
@@ -421,7 +421,7 @@ impl DWFALite {
 
     /// Applies the remaining edits when every diagonal is at or past the end of `other_seq`.
     /// Early mode needs the baseline end. Ordinary mode needs the terminal diagonal to become reachable;
-    /// the all-lanes guard guarantees that it has already consumed the other sequence once it exists.
+    /// the check that every diagonal is at the end guarantees that it has already consumed the other sequence once it exists.
     /// Keep the full wavefront using the same closed-form growth as repeated individual edits.
     /// # Arguments
     /// * `baseline_len` - the length of the baseline sequence
@@ -597,7 +597,7 @@ impl DWFALite {
                     symbols.push(baseline_seq[offset]);
                 }
             },
-            // the bounds enclose the equality lanes; holes inside the range are skipped
+            // the bounds enclose the frontier diagonals; holes inside the range are skipped
             Frontier::Wide { start, end } if other_seq.len() == self.extended_len => {
                 for (relative, &d) in self.wavefront[start..end].iter().enumerate() {
                     if d + self.offset == other_seq.len() {
@@ -681,8 +681,7 @@ mod tests {
     fn test_bulk_finalize_matches_individual_growth() {
         // Global mode must finish both sequences, early mode only needs to finish the baseline
         for early in [false, true] {
-            // Try no cap, a zero cap, and caps around 64 edits
-            // and the expected final distances (770 or 800 edits)
+            // Try no cap, a zero cap, a few small caps, and caps around the expected final distances (770 or 800 edits)
             for cap in [None, Some(0), Some(63), Some(64), Some(65), Some(769), Some(770), Some(771), Some(799), Some(800), Some(801)] {
                 // Skipping a seven-byte prefix should give the same result as starting at position 0
                 for offset in [0, 7] {
@@ -793,8 +792,7 @@ mod tests {
         }
     }
 
-    /// The wavefront algorithm before the frontier and growth changes: grow by scattering into a zeroed wavefront,
-    /// then extend every diagonal one symbol at a time.
+    /// A simple reference wavefront: grow by scattering into a new wavefront, then extend every diagonal one symbol at a time.
     /// # Arguments
     /// * `baseline` - the baseline sequence, theoretically fixed
     /// * `other` - the other sequence
@@ -836,7 +834,7 @@ mod tests {
     }
 
     /// Like the `finalize` benchmark: `other` is `baseline` without one stretch, with a few errors.
-    /// Large gaps give wide wavefronts. The whole `other` is pushed at once, then `finalize` adds the gap.
+    /// Large gaps give long wavefronts. The whole `other` is pushed at once, then `finalize` adds the gap.
     #[test]
     fn test_gapped_pairs_against_reference() {
         use rand::{Rng, SeedableRng};
@@ -945,15 +943,15 @@ mod tests {
     }
 
     fn assert_frontier_invariant(dwfa: &DWFALite, other: &[u8]) {
-        let equality_lanes: Vec<usize> = dwfa.wavefront.iter().enumerate()
+        let frontier_diagonals: Vec<usize> = dwfa.wavefront.iter().enumerate()
             .filter_map(|(i, &d)| (d + dwfa.offset == other.len()).then_some(i))
             .collect();
         match dwfa.frontier {
-            Frontier::Single(i) => assert_eq!(equality_lanes, vec![i]),
-            Frontier::Wide { start, end } => match equality_lanes.as_slice() {
+            Frontier::Single(i) => assert_eq!(frontier_diagonals, vec![i]),
+            Frontier::Wide { start, end } => match frontier_diagonals.as_slice() {
                 [] => assert_eq!((start, end), (0, 0)),
-                [i] => panic!("single equality lane {i} should use Frontier::Single"),
-                lanes => assert_eq!((start, end), (*lanes.first().unwrap(), lanes.last().unwrap() + 1)),
+                [i] => panic!("single frontier diagonal {i} should use Frontier::Single"),
+                diagonals => assert_eq!((start, end), (*diagonals.first().unwrap(), diagonals.last().unwrap() + 1)),
             },
             Frontier::Unknown => {},
         }

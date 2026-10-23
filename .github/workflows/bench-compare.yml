@@ -102,10 +102,10 @@ jobs:
             return `![${text}](https://img.shields.io/badge/${message}-${hex}?style=flat-square)`;
           }
 
-          // Grey inside the noise band. Outside it, green (faster) or red (slower)
-          // saturates across the next 20 percentage points.
+          // Grey inside the noise band, and for any change under 1%. Outside that,
+          // green (faster) or red (slower) saturates across the next 20 percentage points.
           function percentBadge(text, pct, noise) {
-            const excess = Math.abs(pct) - noise;
+            const excess = Math.abs(pct) - Math.max(noise, 1);
             if (excess <= 0) return colorBadge(text, '6e7781');
             const t = Math.min(excess / 20, 1);
             const hex = pct < 0 ? mix('c8f7d4', '1a7f37', t) : mix('ffd0cc', 'cf222e', t);
@@ -191,7 +191,7 @@ jobs:
               '|------|--------------|------------------|---|',
               body,
               '',
-              'Combined adds the mean of every case measured on both sides. Grey is inside the noise of the two runs. Green is faster and red is slower, and the color deepens over the next 20 percentage points.',
+              'Combined adds the mean of every case measured on both sides. Grey is inside the noise of the two runs, or a change under 1%. Green is faster and red is slower, and the color deepens over the next 20 percentage points.',
               '',
               '  </details>',
               '',

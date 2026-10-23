@@ -77,17 +77,39 @@ jobs:
             return `${(nanos / div).toFixed(1)}±${(stddev / div).toFixed(2)}${label}`;
           }
 
-          // Same overlap test as rust-bench-compare-action.
-          function isSignificant(changesDur, changesErr, baseDur, baseErr) {
-            if (changesDur < baseDur) {
-              return changesDur + changesErr < baseDur || baseDur - baseErr > changesDur;
-            }
-            return changesDur - changesErr > baseDur || baseDur + baseErr < changesDur;
-          }
-
           function formatDifference(base, changes) {
             const difference = -(1 - changes / base) * 100;
             return (changes <= base ? '' : '+') + difference.toFixed(2) + '%';
+          }
+
+          // Combined relative noise of the two means, in percentage points.
+          function noisePercent(base, changes) {
+            const baseRel = base.mean > 0 ? base.stddev / base.mean : 0;
+            const changesRel = changes.mean > 0 ? changes.stddev / changes.mean : 0;
+            return 100 * Math.hypot(baseRel, changesRel);
+          }
+
+          function mix(from, to, t) {
+            const channel = (hex, i) => parseInt(hex.slice(i, i + 2), 16);
+            const blended = [0, 2, 4].map((i) => Math.round(channel(from, i) + (channel(to, i) - channel(from, i)) * t));
+            return blended.map((value) => value.toString(16).padStart(2, '0')).join('');
+          }
+
+          // GitHub strips style attributes. A badge keeps a real color, and its own
+          // background stays readable in light and dark mode.
+          function colorBadge(text, hex) {
+            const message = text.replaceAll('-', '--').replaceAll('_', '__').replaceAll(' ', '_').replaceAll('%', '%25').replaceAll('+', '%2B');
+            return `![${text}](https://img.shields.io/badge/${message}-${hex}?style=flat-square)`;
+          }
+
+          // Grey inside the noise band. Outside it, green (faster) or red (slower)
+          // saturates across the next 20 percentage points.
+          function percentBadge(text, pct, noise) {
+            const excess = Math.abs(pct) - noise;
+            if (excess <= 0) return colorBadge(text, '6e7781');
+            const t = Math.min(excess / 20, 1);
+            const hex = pct < 0 ? mix('c8f7d4', '1a7f37', t) : mix('ffd0cc', 'cf222e', t);
+            return colorBadge(text, hex);
           }
 
           function loadSide(file) {
@@ -122,19 +144,25 @@ jobs:
 
           const rows = [...byKey.values()].sort((a, b) => a.name.localeCompare(b.name));
 
+          // Sum only the cases measured on both sides. The spread of a sum is the
+          // root-sum-square of the spreads, so the total keeps a noise band.
+          function combinedRow(paired) {
+            const total = (pick) => ({
+              mean: paired.reduce((sum, row) => sum + pick(row).mean, 0),
+              stddev: Math.hypot(...paired.map((row) => pick(row).stddev)),
+            });
+            return { name: '**Combined**', upstream: total((row) => row.upstream), new: total((row) => row.new) };
+          }
+
           function formatRow(row) {
             const base = row.upstream;
             const changes = row.new;
-            let baseText = base ? formatTime(base.mean, base.stddev) : 'N/A';
-            let changesText = changes ? formatTime(changes.mean, changes.stddev) : 'N/A';
+            const baseText = base ? formatTime(base.mean, base.stddev) : 'N/A';
+            const changesText = changes ? formatTime(changes.mean, changes.stddev) : 'N/A';
             let difference = 'N/A';
             if (base && changes && base.mean > 0) {
-              difference = formatDifference(base.mean, changes.mean);
-              if (isSignificant(changes.mean, changes.stddev, base.mean, base.stddev)) {
-                difference = `**${difference}**`;
-                if (changes.mean < base.mean) changesText = `**${changesText}**`;
-                else baseText = `**${baseText}**`;
-              }
+              const pct = -(1 - changes.mean / base.mean) * 100;
+              difference = percentBadge(formatDifference(base.mean, changes.mean), pct, noisePercent(base, changes));
             }
             return `| ${row.name.replace(/\|/g, '\\|')} | ${baseText} | ${changesText} | ${difference} |`;
           }
@@ -152,7 +180,8 @@ jobs:
               '',
             ].join('\n');
           } else {
-            const body = rows.map(formatRow).join('\n');
+            const paired = rows.filter((row) => row.upstream && row.new);
+            const body = [...rows.map(formatRow), ...(paired.length ? [formatRow(combinedRow(paired))] : [])].join('\n');
             markdown = [
               `## Criterion Benchmark (consensus_bench) for ${shortSha}`,
               '  <details>',
@@ -161,6 +190,8 @@ jobs:
               '| Test | Base         | PR               | % |',
               '|------|--------------|------------------|---|',
               body,
+              '',
+              'Combined adds the mean of every case measured on both sides. Grey is inside the noise of the two runs. Green is faster and red is slower, and the color deepens over the next 20 percentage points.',
               '',
               '  </details>',
               '',

@@ -1,11 +1,5 @@
 use std::collections::VecDeque;
 
-/// Largest wavefront that grows in place.
-/// Wider wavefronts use the allocating gather in `grow_wide_wavefront`, which skips diagonals
-/// already past the end of a sequence. `finalize` also switches to closed-form edits at this width.
-/// Both growers record equality-lane bounds; this cutoff is only which implementation runs.
-pub(super) const NARROW_GROWTH_LIMIT: usize = 128;
-
 /// Cached extrema after one growth.
 /// `max_wavefront` is the farthest position reached after `offset`; add `offset` for the index in `other_seq`.
 /// `max_baseline` is the farthest consumed position in `baseline_seq`.
@@ -48,7 +42,7 @@ impl GrownWavefront {
 // * insertion of a base into `baseline_seq` from diagonal `i - 2`; this progresses `other_seq`
 // Diagonal 0 has only a deletion, diagonal 1 has no insertion, and the two new diagonals at the end have no deletion.
 
-/// Grows a wavefront that fits `NARROW_GROWTH_LIMIT`, in place, and records equality-lane bounds.
+/// Grows a wavefront in place and records equality-lane bounds.
 /// It is filled from the end, so that `wavefront[i - 2..=i]` still holds the old values when diagonal `i` is computed.
 /// The `Vec` grows with amortized doubling, and a clone has spare capacity, so most calls do not allocate.
 /// # Arguments
@@ -56,9 +50,8 @@ impl GrownWavefront {
 /// * `grower` - the sequences and edit distance for the new diagonals
 #[inline(always)]
 pub(super) fn grow_wavefront(wavefront: &mut Vec<usize>, mut grower: WavefrontGrower<'_>) -> GrownWavefront {
-    // `old_len + 2 <= NARROW_GROWTH_LIMIT` selects this in-place implementation.
     let old_len = wavefront.len();
-    debug_assert!(old_len > 0 && old_len + 2 <= NARROW_GROWTH_LIMIT);
+    debug_assert!(old_len > 0);
     
     // Resize the wavefront to the new length.
     wavefront.resize(old_len + 2, 0);
@@ -90,61 +83,6 @@ pub(super) fn grow_wavefront(wavefront: &mut Vec<usize>, mut grower: WavefrontGr
     // visit first diagonal.
     wavefront[0] = grower.visit(0, wavefront[0]);
     grower.grown
-}
-
-/// Grows a wide wavefront in two passes over a new allocation. The diagonal values match `grow_wavefront()`,
-/// and the equality-lane bounds are recorded the same way. Wide wavefronts come from large edit distances,
-/// e.g., in `finalize()`, where most diagonals are past the end of a sequence and can never extend again.
-/// A separate pass lets the gather use vector instructions, and the extension pass skips those diagonals
-/// with a well-predicted branch.
-/// # Arguments
-/// * `wavefront` - the wavefront to replace with the grown one
-/// * `baseline_seq` - the baseline sequence, theoretically fixed
-/// * `other_seq` - the other sequence, typically getting updates
-/// * `edit_distance` - the edit distance of the grown wavefront
-/// * `offset` - the offset into `other_seq` where the baseline starts
-/// * `wildcard` - an optional wildcard symbol
-pub(super) fn grow_wide_wavefront(
-    wavefront: &mut Vec<usize>, baseline_seq: &[u8], other_seq: &[u8], edit_distance: usize, offset: usize, wildcard: Option<u8>
-) -> GrownWavefront {
-    let old = &wavefront[..];
-    let old_len = old.len();
-    debug_assert!(old_len >= 2);
-    let mut new_wavefront: Vec<usize> = Vec::with_capacity(old_len + 2);
-
-    // These produce diagonals 0, 1, 2..old_len-1, old_len, and old_len+1 respectively.
-    // gather, see `grow_wavefront()` for the three moves
-    // first two diagonals can only come from the first two old diagonals
-    new_wavefront.push(old[0]);
-    new_wavefront.push(old[1].max(old[0] + 1));
-
-    // standard 3 possible sources for each diagonal
-    new_wavefront.extend(old.windows(3).map(|w| w[2].max(w[1] + 1).max(w[0] + 1)));
-
-    // last two diagonals can only come from the last two old diagonals
-    new_wavefront.push((old[old_len - 1] + 1).max(old[old_len - 2] + 1));
-    new_wavefront.push(old[old_len - 1] + 1);
-
-    // extend and get the maxima; `match_length()` is 0 for a diagonal at or past the end of either sequence
-    let (baseline_len, other_len) = (baseline_seq.len(), other_seq.len());
-    let mut grown = GrownWavefront::new();
-    for (i, d) in new_wavefront.iter_mut().enumerate() {
-        // extend the diagonal where possible
-        if *d + offset < other_len && *d + edit_distance - i < baseline_len {
-            *d += match_length(baseline_seq, other_seq, *d + edit_distance - i, *d + offset, wildcard);
-        }
-
-        // update the GrownWavefront statistics based on the maximal extension
-        grown.max_wavefront = grown.max_wavefront.max(*d);
-        grown.max_baseline = grown.max_baseline.max(*d + edit_distance - i);
-        if *d + offset == other_len {
-            grown.record_equality_lane(i);
-        }
-    }
-
-    // replace the old wavefront, return the GrownWavefront statistics
-    *wavefront = new_wavefront;
-    grown
 }
 
 /// Conceptually, this function plays out the wavefront edit distance extension.

@@ -4,7 +4,7 @@ use simple_error::bail;
 use super::dwfa_config::DWFALiteConfig;
 use super::votes::{ExtensionVotes, VoteScratch, VoteSymbols};
 use super::wavefront::{
-    grow_wavefront, grow_wide_wavefront, grow_without_matches, match_length, WavefrontGrower, NARROW_GROWTH_LIMIT,
+    grow_wavefront, grow_without_matches, match_length, WavefrontGrower,
 };
 
 /// Lifecycle of a [`DWFALite`].
@@ -402,14 +402,12 @@ impl DWFALite {
         // first, increase the distance we're at
         self.edit_distance += 1;
 
-        // Grow and re-extend. Small wavefronts grow in place; wider ones use the allocating gather.
-        // Both record equality-lane bounds. A lane past the end of `other_seq` cannot be named that way.
+        // Grow and re-extend in place. A lane past the end of `other_seq` cannot be named by equality bounds.
         let (edit_distance, offset, wildcard) = (self.edit_distance, self.offset, self.config.wildcard);
-        let grown = if self.wavefront.len() + 2 <= NARROW_GROWTH_LIMIT {
-            grow_wavefront(&mut self.wavefront, WavefrontGrower::new(baseline_seq, other_seq, edit_distance, offset, wildcard))
-        } else {
-            grow_wide_wavefront(&mut self.wavefront, baseline_seq, other_seq, edit_distance, offset, wildcard)
-        };
+        let grown = grow_wavefront(
+            &mut self.wavefront,
+            WavefrontGrower::new(baseline_seq, other_seq, edit_distance, offset, wildcard),
+        );
         self.max_wavefront = grown.max_wavefront;
         self.max_baseline = grown.max_baseline;
         self.frontier = if offset + grown.max_wavefront > other_seq.len() {
@@ -488,7 +486,7 @@ impl DWFALite {
             // Once every diagonal is at or past the end of `other_seq`, no diagonal can extend again, and the remaining
             // edits have a closed form. Values only grow, so this stays true. The scan usually stops at once, on a low
             // diagonal that has not reached the end. In the worst case, it adds one pass per edit to the growth pass.
-            if self.wavefront.len() > NARROW_GROWTH_LIMIT && self.wavefront.iter().all(|&d| d + self.offset >= other_seq.len()) {
+            if self.wavefront.iter().all(|&d| d + self.offset >= other_seq.len()) {
                 self.finish_without_matches(baseline_seq.len(), other_seq.len());
             } else {
                 // The selected endpoint still needs another edit.
@@ -677,14 +675,13 @@ impl DWFALite {
 mod tests {
     use super::*;
     use super::super::dwfa_config::DWFALiteConfigBuilder;
-    use super::super::wavefront::NARROW_GROWTH_LIMIT;
 
     /// Checks that finishing many edits at once gives the same result as adding one edit at a time
     #[test]
     fn test_bulk_finalize_matches_individual_growth() {
         // Global mode must finish both sequences, early mode only needs to finish the baseline
         for early in [false, true] {
-            // Try no cap, a zero cap, and caps around the wide-wavefront boundary (64 edits)
+            // Try no cap, a zero cap, and caps around 64 edits
             // and the expected final distances (770 or 800 edits)
             for cap in [None, Some(0), Some(63), Some(64), Some(65), Some(769), Some(770), Some(771), Some(799), Some(800), Some(801)] {
                 // Skipping a seven-byte prefix should give the same result as starting at position 0
@@ -711,18 +708,8 @@ mod tests {
 
                         // Expected setup: grow a copy one edit at a time until finished or capped
                         let mut expected = actual.clone();
-                        let mut reaches_bulk_guard = false;
                         while expected.edit_distance() < distance && !expected.edit_distance_at_limit() {
-                            // Bulk growth is possible once the wavefront is past `NARROW_GROWTH_LIMIT`
-                            // and every diagonal has reached the end of the other sequence
-                            reaches_bulk_guard |= expected.wavefront().len() > NARROW_GROWTH_LIMIT
-                                && expected.wavefront().iter().all(|&d| d + offset >= other.len());
                             expected.increase_edit_distance(&baseline, &other).unwrap();
-                        }
-
-                        // Matching and empty inputs should reach bulk growth unless the cap stops them at 64 or earlier
-                        if suffix.first() != Some(&b'C') && cap.is_none_or(|cap| cap > 64) {
-                            assert!(reaches_bulk_guard);
                         }
 
                         // Compare: finalize normally and check the result against individual growth
@@ -771,12 +758,11 @@ mod tests {
     fn test_random_against_reference() {
         use rand::{Rng, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
-        let mut max_seen = 0;
         for trial in 0..300 {
             let wildcard = if trial % 3 == 0 { Some(b'*') } else { None };
             let alphabet: &[u8] = if wildcard.is_some() { b"ACGT*" } else { b"ACGT" };
             let baseline: Vec<u8> = (0..rng.gen_range(0..200)).map(|_| alphabet[rng.gen_range(0..alphabet.len())]).collect();
-            // related pairs keep the distance small; unrelated pairs push it past `NARROW_GROWTH_LIMIT`
+            // Related pairs keep the distance small; unrelated pairs exercise long edit paths.
             let mut other: Vec<u8> = if trial % 2 == 0 {
                 baseline.iter().filter(|_| rng.gen_range(0..10) != 0).cloned().collect()
             } else {
@@ -804,10 +790,7 @@ mod tests {
             }
             dwfa.finalize(&baseline, &other).unwrap();
             assert_eq!(dwfa.edit_distance(), table[baseline.len()][other.len() - offset], "trial {trial}, finalized");
-            max_seen = max_seen.max(dwfa.edit_distance());
         }
-        // make sure the wide-wavefront growth was exercised
-        assert!(2 * max_seen + 1 > NARROW_GROWTH_LIMIT);
     }
 
     /// The wavefront algorithm before the frontier and growth changes: grow by scattering into a zeroed wavefront,
@@ -858,7 +841,6 @@ mod tests {
     fn test_gapped_pairs_against_reference() {
         use rand::{Rng, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(13);
-        let mut max_seen = 0;
         for trial in 0..60 {
             let wildcard = if trial % 4 == 0 { Some(b'*') } else { None };
             let alphabet: &[u8] = if wildcard.is_some() { b"ACGT*" } else { b"ACGT" };
@@ -889,10 +871,7 @@ mod tests {
             assert_eq!(dwfa.edit_distance(), expected_final, "trial {trial}, finalized");
             assert_eq!(dwfa.wavefront(), &expected_wavefront[..], "trial {trial}, wavefront");
             assert_eq!(dwfa.maximum_other_distance(), *expected_wavefront.iter().max().unwrap(), "trial {trial}");
-            max_seen = max_seen.max(dwfa.edit_distance());
         }
-        // make sure that both the narrow and the wide growth were exercised
-        assert!(2 * max_seen + 1 > 4 * NARROW_GROWTH_LIMIT);
     }
 
     #[test]
